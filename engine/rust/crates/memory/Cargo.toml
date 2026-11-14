@@ -1,6 +1,6 @@
 [package]
 name = "memory"
-description = "Placeholder for the engine's allocators and memory tracking; not yet implemented"
+description = "Coreverse's memory layer: alignment, size and layout helpers today; arenas, pools and memory tracking are planned"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true

@@ -9,5 +9,6 @@
 - [Runtime](runtime.md)
 - [Rendering](rendering.md)
 - [Math](math.md)
+- [Memory](memory.md)
 - [Editor](editor.md)
 - [Continuous integration](ci.md)
