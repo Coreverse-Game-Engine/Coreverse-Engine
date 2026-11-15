@@ -84,9 +84,9 @@ pub mod size;
 
 pub use align::Alignment;
 pub use bump::{Bump, Marker};
+pub use ccore::Handle;
 pub use error::{MemoryError, MemoryResult};
 pub use frame::FrameArena;
 pub use layout::{array_layout, layout_from_parts};
-pub use ccore::Handle;
 pub use pool::Pool;
 pub use size::ByteSize;
