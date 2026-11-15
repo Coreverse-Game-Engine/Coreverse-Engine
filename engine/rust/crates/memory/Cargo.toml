@@ -1,12 +1,13 @@
 [package]
 name = "memory"
-description = "Coreverse's memory layer: alignment, size and layout helpers and bump/frame arenas today; pools and memory tracking are planned"
+description = "Coreverse's memory layer: alignment, size and layout helpers and bump and frame arenas, and a generational pool today; memory tracking is planned"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+ccore = { path = "../ccore" }
 
 [lints]
 workspace = true

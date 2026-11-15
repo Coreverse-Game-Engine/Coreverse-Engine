@@ -832,6 +832,9 @@ dependencies = [
 [[package]]
 name = "memory"
 version = "0.1.0"
+dependencies = [
+ "ccore",
+]
 
 [[package]]
 name = "ndk"

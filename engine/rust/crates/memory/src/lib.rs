@@ -40,11 +40,26 @@
 //! # Ok::<(), memory::MemoryError>(())
 //! ```
 //!
+//! **M3, the pool.** Entirely safe code:
+//!
+//! * [`Pool`]: stores values and addresses them by [`ccore::Handle`] (slot index plus generation). Removing a value
+//!   makes every old handle to it stale, even after the slot is reused; a stale or invented handle finds nothing.
+//!
+//! ```
+//! use memory::Pool;
+//!
+//! let mut pool = Pool::new();
+//! let handle = pool.insert("hello")?;
+//! assert_eq!(pool.get(handle), Some(&"hello"));
+//! pool.remove(handle);
+//! assert_eq!(pool.get(handle), None);
+//! # Ok::<(), memory::MemoryError>(())
+//! ```
+//!
 //! # What is planned
 //!
-//! A generational `Pool<T>` on top of `ccore::Handle` (M3), allocation tracking with an opt-in
-//! `#[global_allocator]` wrapper (M4), and the FFI counters for C++ (M5). None of that exists yet, and nothing here
-//! is stable API before the crate leaves its early milestones.
+//! Allocation tracking with an opt-in `#[global_allocator]` wrapper (M4) and the FFI counters for C++ (M5). None of
+//! that exists yet, and nothing here is stable API before the crate leaves its early milestones.
 //!
 //! # Conventions
 //!
@@ -64,6 +79,7 @@ mod bump;
 pub mod error;
 pub mod frame;
 pub mod layout;
+pub mod pool;
 pub mod size;
 
 pub use align::Alignment;
@@ -71,4 +87,6 @@ pub use bump::{Bump, Marker};
 pub use error::{MemoryError, MemoryResult};
 pub use frame::FrameArena;
 pub use layout::{array_layout, layout_from_parts};
+pub use ccore::Handle;
+pub use pool::Pool;
 pub use size::ByteSize;

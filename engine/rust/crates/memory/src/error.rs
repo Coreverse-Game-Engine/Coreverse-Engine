@@ -34,6 +34,9 @@ pub enum MemoryError {
         size: usize,
     },
 
+    /// A [`Pool`](crate::Pool) already uses all of its 2^32 slots (a slot index is a `u32`).
+    PoolFull,
+
     /// A [`Marker`](crate::Marker) lies beyond the arena's current position: it was taken after a state the arena
     /// has been reset or rewound past.
     InvalidMarker,
@@ -59,6 +62,9 @@ impl fmt::Display for MemoryError {
             }
             Self::AllocationFailed { size } => {
                 write!(f, "the system allocator could not provide {size} bytes")
+            }
+            Self::PoolFull => {
+                write!(f, "the pool cannot hold more than 2^32 slots")
             }
             Self::InvalidMarker => {
                 write!(f, "marker lies beyond the current allocation position")
@@ -101,6 +107,10 @@ mod tests {
         assert_eq!(
             MemoryError::AllocationFailed { size: 4096 }.to_string(),
             "the system allocator could not provide 4096 bytes"
+        );
+        assert_eq!(
+            MemoryError::PoolFull.to_string(),
+            "the pool cannot hold more than 2^32 slots"
         );
         assert_eq!(
             MemoryError::InvalidMarker.to_string(),

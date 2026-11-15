@@ -1,7 +1,7 @@
 # Memory
 
 `engine/rust/crates/memory` is the engine's memory layer. It is being built in milestones; this page describes what
-exists **today** (M1, the foundation, and M2, arenas). Pools and allocation tracking are planned and not implemented
+exists **today** (M1, the foundation, M2, arenas, and M3, the pool). Allocation tracking is planned and not implemented
 yet.
 
 ## What is there
@@ -14,7 +14,7 @@ yet.
 | `layout_from_parts(size, align)`  | A `Layout` from raw numbers, with every check reported as an error.                                                          |
 | `array_layout(element, count)`    | The layout of `count` elements placed like a Rust array (stride = size rounded up to the alignment).                         |
 | `ByteSize`                        | A byte count for budgets and reports: binary units, checked/saturating arithmetic, `Display` (`1.5 KiB`, `3.0 MiB`, ...).    |
-| `MemoryError`, `MemoryResult`     | `InvalidAlignment`, `SizeOverflow`, `OutOfMemory`, `AllocationFailed`, `InvalidMarker`. `#[non_exhaustive]`.                 |
+| `MemoryError`, `MemoryResult`     | `InvalidAlignment`, `SizeOverflow`, `OutOfMemory`, `AllocationFailed`, `PoolFull`, `InvalidMarker`. `#[non_exhaustive]`.   |
 
 ### Arenas (M2)
 
@@ -61,14 +61,48 @@ Limits, on purpose:
   marker useful for scratch work between two phases, not for nested scopes that keep outer data alive.
 * **A `Bump` is `Send` but not `Sync`.** It can move to another thread, not be shared between threads.
 
+### Pool (M3)
+
+| Item   | Purpose                                                                                                                                                      |
+|:-------|:-------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `Pool` | Stores values of any type `T` and addresses them by `Handle<T>` (re-exported from `ccore`): `insert`, `get`, `get_mut`, `contains`, `remove`, `clear`, `iter`, `iter_mut`, `len`, `capacity`, `retired_slots`. |
+
+```rust,ignore
+use memory::Pool;
+
+let mut textures: Pool<String> = Pool::new();
+let grass = textures.insert("grass.png".to_string())?;
+textures.remove(grass);
+let sand = textures.insert("sand.png".to_string())?; // reuses the slot of `grass` ...
+assert!(textures.get(grass).is_none());              // ... but `grass` is stale
+assert!(textures.get(sand).is_some());
+```
+
+A handle is a slot index plus a generation. Removing a value bumps the slot's generation, so every older handle to it is
+stale: `get`, `get_mut`, `contains` and `remove` answer `None` for it, also after the slot has been reused. A stale,
+forged or never-issued handle can therefore not reach a wrong value and is never undefined behaviour. The pool is entirely
+safe code (no `unsafe`).
+
+* **Handles do not know their pool.** A handle used on another `Pool<T>` than the one that issued it may find an
+  unrelated value. Keep handles with their pool.
+* **Reuse and growth.** The slot that was freed last is reused first. The pool grows when no slot is free and never
+  shrinks; `Pool::with_capacity(n)` reserves room so that `n` inserts do not allocate. Growth failure is an error
+  (`AllocationFailed`), not an abort.
+* **Retired slots.** After 2^32 - 1 reuses a slot's generation counter is exhausted; the slot is retired and never used
+  again (`retired_slots()`), instead of letting very old handles look valid again. It costs one slot until the pool is
+  dropped.
+* **At most 2^32 slots** (`PoolFull`), because an index is a `u32`.
+* **On an insert error the value is dropped.**
+* **Dependency.** The pool needs `ccore::Handle`, so `memory` depends on `ccore` (which has no dependency on `memory`).
+
 ## Conventions
 
 * **No panics on bad input.** Sizes and alignments that come from outside are validated and reported as a
   `MemoryError`. `ByteSize` offers checked and saturating arithmetic only, no operators.
 * **`unsafe` in one private module.** The workspace denies `unsafe_code`; `bump` is allowed it, with the reason spelled
   out in the `#[allow]`. Every `unsafe` block carries a safety comment, the invariants are listed at the top of the
-  module, and the public API is safe. `FrameArena` is plain safe code on top of `Bump`.
-* **No dependencies, stable Rust.** `allocator_api` is unstable, so allocators cannot be plugged into `Vec<T, A>`; the
+  module, and the public API is safe. `FrameArena` and `Pool` are plain safe code.
+* **One dependency (`ccore`, for `Handle`), stable Rust.** `allocator_api` is unstable, so allocators cannot be plugged into `Vec<T, A>`; the
   arenas hand out references and slices instead of depending on an allocator crate.
 
 ## Roadmap
@@ -77,7 +111,7 @@ Limits, on purpose:
 |:----------|:------------------------------------------------------------------------------------------|:--------|
 | M1        | `Alignment`, checked layouts, `ByteSize`, `MemoryError`                                   | done    |
 | M2        | `Bump` (with markers), `FrameArena`; the first `unsafe`                                   | done    |
-| M3        | `Pool<T>` with `ccore::Handle<T>`: stale handles are rejected                             | planned |
+| M3        | `Pool<T>` with `ccore::Handle<T>`: stale handles are rejected                             | done    |
 | M4        | `MemoryTag`, atomic counters, opt-in `TrackingAllocator`, snapshots, budgets, leak report | planned |
 | M5        | FFI: `ffi_memory_stats` and a `cv-ffi` wrapper; optional C++ allocation hooks             | planned |
 | M6        | criterion benchmarks, remaining docs                                                      | planned |
