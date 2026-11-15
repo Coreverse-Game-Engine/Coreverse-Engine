@@ -1,6 +1,6 @@
 [package]
 name = "memory"
-description = "Coreverse's memory layer: alignment, size and layout helpers today; arenas, pools and memory tracking are planned"
+description = "Coreverse's memory layer: alignment, size and layout helpers and bump/frame arenas today; pools and memory tracking are planned"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true

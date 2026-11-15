@@ -3,8 +3,7 @@
 //!
 //! # What is here today
 //!
-//! The first milestone (M1) is the foundation the later ones stand on. It has no dependencies and no `unsafe`
-//! code:
+//! **M1, the foundation.** No dependencies, no `unsafe` code:
 //!
 //! * [`Alignment`]: a validated power-of-two alignment with `align_up`, `align_down` and padding arithmetic.
 //! * [`layout_from_parts`] and [`array_layout`]: checked construction of [`core::alloc::Layout`] from sizes and
@@ -12,6 +11,13 @@
 //! * [`ByteSize`]: a byte count with binary units, checked and saturating arithmetic and a readable `Display`,
 //!   for budgets, limits and statistics.
 //! * [`MemoryError`] and [`MemoryResult`].
+//!
+//! **M2, arenas.** The first (and only) `unsafe` code of the crate, in the private `bump` module:
+//!
+//! * [`Bump`]: a fixed-capacity bump allocator for `Copy` values. Allocating takes `&self` and returns a reference;
+//!   freeing ([`Bump::reset`], [`Bump::rewind`] to a [`Marker`]) takes `&mut self`, so the compiler rejects every use
+//!   of memory that has been given back.
+//! * [`FrameArena`]: a `Bump` that is emptied once per frame, with a frame counter and the previous frame's usage.
 //!
 //! ```
 //! use memory::{Alignment, ByteSize};
@@ -22,27 +28,47 @@
 //! # Ok::<(), memory::MemoryError>(())
 //! ```
 //!
+//! ```
+//! use memory::Bump;
+//!
+//! let mut scratch = Bump::with_capacity(4096)?;
+//! let name = scratch.alloc_slice_copy(b"player")?;
+//! let health = scratch.alloc(100u32)?;
+//! *health -= 25;
+//! assert_eq!((name.len(), *health), (6, 75));
+//! scratch.reset(); // `name` and `health` can no longer be used
+//! # Ok::<(), memory::MemoryError>(())
+//! ```
+//!
 //! # What is planned
 //!
-//! Arenas (`Bump`, `FrameArena`, `StackArena`), a generational `Pool<T>` on top of `ccore::Handle`, allocation
-//! tracking with an opt-in `#[global_allocator]` wrapper, and the FFI counters for C++. Nothing of that exists yet
-//! and nothing here is stable API before the crate leaves its early milestones.
+//! A generational `Pool<T>` on top of `ccore::Handle` (M3), allocation tracking with an opt-in
+//! `#[global_allocator]` wrapper (M4), and the FFI counters for C++ (M5). None of that exists yet, and nothing here
+//! is stable API before the crate leaves its early milestones.
 //!
 //! # Conventions
 //!
-//! * The workspace denies `unsafe_code`. The allocators of later milestones need it; it will live in one private
-//!   module with a safety comment on every block, never in the public API.
-//! * Stable Rust only: `allocator_api` is unstable, so allocators will not plug into `Vec<T, A>`; this crate will
-//!   provide its own small container types instead.
+//! * The workspace denies `unsafe_code`. It is allowed for the private `bump` module only (with the reason spelled
+//!   out), every `unsafe` block there carries a safety comment, and the public API is safe.
+//! * Stable Rust only: `allocator_api` is unstable, so allocators do not plug into `Vec<T, A>`; the arenas hand out
+//!   references and slices instead.
 //! * No function here panics on bad input; sizes and alignments that come from outside are validated and reported
 //!   as a [`MemoryError`].
 
 pub mod align;
+#[allow(
+    unsafe_code,
+    reason = "the bump allocator hands out references into a block it owns; every unsafe block documents why it is sound, and the public API is safe"
+)]
+mod bump;
 pub mod error;
+pub mod frame;
 pub mod layout;
 pub mod size;
 
 pub use align::Alignment;
+pub use bump::{Bump, Marker};
 pub use error::{MemoryError, MemoryResult};
+pub use frame::FrameArena;
 pub use layout::{array_layout, layout_from_parts};
 pub use size::ByteSize;

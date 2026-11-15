@@ -4,7 +4,7 @@
 engine/
 ├── rust/            Rust 2024 workspace
 │   ├── common/      ccore, fs, log-core, log-sinks ...
-│   ├── crates/      vfs, ffi, math, platform, memory (foundation only), and placeholder crates for future systems
+│   ├── crates/      vfs, ffi, math, platform, memory (foundation and arenas), and placeholder crates for future systems
 │   └── macros/      proc macros (vfs-macros, math-macros)
 └── cpp/             C++23
     ├── math/        cv-math: header-only mirror of the Rust math crate

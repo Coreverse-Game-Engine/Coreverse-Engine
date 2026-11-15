@@ -18,6 +18,25 @@ pub enum MemoryError {
     /// A size computation overflowed `usize`, or the result is larger than `isize::MAX`, the biggest size Rust
     /// allows for a single allocation.
     SizeOverflow,
+
+    /// An arena has not enough room left for a request.
+    OutOfMemory {
+        /// The size of the request in bytes (without alignment padding).
+        requested: usize,
+        /// The bytes the arena had left when the request came, before any alignment padding. The padding a request
+        /// needs can make it fail even when `available >= requested`.
+        available: usize,
+    },
+
+    /// The system allocator could not provide a block.
+    AllocationFailed {
+        /// The size of the block in bytes.
+        size: usize,
+    },
+
+    /// A [`Marker`](crate::Marker) lies beyond the arena's current position: it was taken after a state the arena
+    /// has been reset or rewound past.
+    InvalidMarker,
 }
 
 impl fmt::Display for MemoryError {
@@ -28,6 +47,21 @@ impl fmt::Display for MemoryError {
             }
             Self::SizeOverflow => {
                 write!(f, "size computation overflowed or exceeds isize::MAX")
+            }
+            Self::OutOfMemory {
+                requested,
+                available,
+            } => {
+                write!(
+                    f,
+                    "out of memory: {requested} bytes requested, {available} bytes left"
+                )
+            }
+            Self::AllocationFailed { size } => {
+                write!(f, "the system allocator could not provide {size} bytes")
+            }
+            Self::InvalidMarker => {
+                write!(f, "marker lies beyond the current allocation position")
             }
         }
     }
@@ -51,6 +85,26 @@ mod tests {
         assert_eq!(
             MemoryError::SizeOverflow.to_string(),
             "size computation overflowed or exceeds isize::MAX"
+        );
+    }
+
+    #[test]
+    fn arena_messages_are_readable() {
+        let out_of_memory = MemoryError::OutOfMemory {
+            requested: 64,
+            available: 16,
+        };
+        assert_eq!(
+            out_of_memory.to_string(),
+            "out of memory: 64 bytes requested, 16 bytes left"
+        );
+        assert_eq!(
+            MemoryError::AllocationFailed { size: 4096 }.to_string(),
+            "the system allocator could not provide 4096 bytes"
+        );
+        assert_eq!(
+            MemoryError::InvalidMarker.to_string(),
+            "marker lies beyond the current allocation position"
         );
     }
 
