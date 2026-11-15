@@ -3,8 +3,8 @@
 ```text
 engine/
 ├── rust/            Rust 2024 workspace
-│   ├── common/      ccore, fs, log-core, log-sinks ...
-│   ├── crates/      vfs, ffi, math, platform, memory (foundation, arenas and pool), and placeholder crates for future systems
+│   ├── common/      small structures shared by several crates (today: `root`, the file system root enum)
+│   ├── crates/      ccore, fs, log-core, log-sinks, vfs, ffi, math, platform, memory, and placeholder crates for future systems
 │   └── macros/      proc macros (vfs-macros, math-macros)
 └── cpp/             C++23
     ├── math/        cv-math: header-only mirror of the Rust math crate
@@ -15,6 +15,11 @@ engine/
 
 ## Layers
 
+* **`common`** holds only small, simple structures that several crates have to share and that do not belong to
+  any one of them; each is a tiny crate that is almost only a `lib.rs`. Today there is one, `root`: the `Root` enum that
+  names the roots of a project's file tree (assets, build, cache, config, logs, mods, packages, source, temp) together
+  with its stable numeric ids. It is used by `vfs` and by its proc-macro crate `vfs-macros`, which could not share it
+  through `vfs` itself. Anything with real behaviour belongs in `crates/` instead.
 * **Rust core** owns things that benefit from memory safety and testing: the virtual file system, logging,
   filesystem helpers, math, and the operating-system abstraction (`platform`: system info, clocks and timers,
   standard directories, process and thread helpers; see [Platform layer](platform.md)).

@@ -4,6 +4,7 @@ use core::ops::Deref;
 
 use crate::bump::Bump;
 use crate::error::MemoryResult;
+use crate::tag::MemoryTag;
 
 /// An arena for data that lives for one frame: render lists, scratch buffers, temporary strings.
 ///
@@ -44,6 +45,20 @@ impl FrameArena {
     pub fn with_capacity(capacity: usize) -> MemoryResult<Self> {
         Ok(Self {
             bump: Bump::with_capacity(capacity)?,
+            frame: 0,
+            last_frame_used: 0,
+        })
+    }
+
+    /// Like [`FrameArena::with_capacity`], with the block registered under `tag` in the global tracker (see
+    /// [`Bump::with_capacity_tagged`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Bump::with_capacity`].
+    pub fn with_capacity_tagged(capacity: usize, tag: MemoryTag) -> MemoryResult<Self> {
+        Ok(Self {
+            bump: Bump::with_capacity_tagged(capacity, tag)?,
             frame: 0,
             last_frame_used: 0,
         })
@@ -129,6 +144,25 @@ mod tests {
                 available: 0,
             }
         );
+    }
+
+    #[test]
+    fn a_tagged_frame_arena_registers_its_block() {
+        // No other unit test of this crate uses `MemoryTag::Scripting`.
+        let tag = MemoryTag::Scripting;
+        let current = || crate::global_tracker().stats(tag).current.bytes();
+        let before = current();
+
+        let mut frames = FrameArena::with_capacity_tagged(2048, tag).unwrap();
+        assert_eq!(frames.tag(), Some(tag));
+        assert_eq!(current(), before + 2048);
+
+        // Starting a new frame reuses the block: nothing is allocated or freed.
+        frames.begin_frame();
+        assert_eq!(current(), before + 2048);
+
+        drop(frames);
+        assert_eq!(current(), before);
     }
 
     #[test]

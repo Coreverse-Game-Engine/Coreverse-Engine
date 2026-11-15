@@ -56,15 +56,37 @@
 //! # Ok::<(), memory::MemoryError>(())
 //! ```
 //!
+//! **M4, tracking.** Memory is counted in two independent ways:
+//!
+//! * [`MemoryTracker`] counts memory that was *registered* under a [`MemoryTag`] (the engine system it belongs to):
+//!   [`Bump::with_capacity_tagged`] and [`FrameArena::with_capacity_tagged`] register their blocks in the
+//!   [`global_tracker`]. It supports an advisory budget per tag and a [`MemoryReport`] whose
+//!   [`leaks`](MemoryReport::leaks) lists the tags that still have bytes in use at shutdown.
+//! * [`TrackingAllocator`] wraps the global allocator and counts every Rust allocation of the process (bytes in
+//!   use, peak, totals, number of calls) without knowing the system an allocation belongs to. Nothing installs it;
+//!   a binary opts in with `#[global_allocator]`.
+//!
+//! ```
+//! use memory::{ByteSize, Bump, MemoryTag, global_tracker};
+//!
+//! global_tracker().set_budget(MemoryTag::Rendering, Some(ByteSize::from_mib(64)));
+//! let frame_memory = Bump::with_capacity_tagged(1 << 20, MemoryTag::Rendering)?;
+//! assert!(!global_tracker().is_over_budget(MemoryTag::Rendering));
+//! assert!(global_tracker().report().has_leaks()); // still alive: would be a leak at shutdown
+//! drop(frame_memory);
+//! assert!(!global_tracker().report().has_leaks());
+//! # Ok::<(), memory::MemoryError>(())
+//! ```
+//!
 //! # What is planned
 //!
-//! Allocation tracking with an opt-in `#[global_allocator]` wrapper (M4) and the FFI counters for C++ (M5). None of
-//! that exists yet, and nothing here is stable API before the crate leaves its early milestones.
+//! The FFI counters for C++ (M5) do not exist yet, and nothing here is stable API before the crate leaves its early
+//! milestones.
 //!
 //! # Conventions
 //!
-//! * The workspace denies `unsafe_code`. It is allowed for the private `bump` module only (with the reason spelled
-//!   out), every `unsafe` block there carries a safety comment, and the public API is safe.
+//! * The workspace denies `unsafe_code`. It is allowed for the private `bump` and `tracking` modules only (with the
+//!   reason spelled out), every `unsafe` block there carries a safety comment, and the public API is safe.
 //! * Stable Rust only: `allocator_api` is unstable, so allocators do not plug into `Vec<T, A>`; the arenas hand out
 //!   references and slices instead.
 //! * No function here panics on bad input; sizes and alignments that come from outside are validated and reported
@@ -81,6 +103,14 @@ pub mod frame;
 pub mod layout;
 pub mod pool;
 pub mod size;
+pub mod stats;
+pub mod tag;
+pub mod tracker;
+#[allow(
+    unsafe_code,
+    reason = "implementing `GlobalAlloc` is `unsafe`; the impl only forwards to the wrapped allocator and counts with atomics, and every unsafe block documents why it is sound"
+)]
+mod tracking;
 
 pub use align::Alignment;
 pub use bump::{Bump, Marker};
@@ -90,3 +120,7 @@ pub use frame::FrameArena;
 pub use layout::{array_layout, layout_from_parts};
 pub use pool::Pool;
 pub use size::ByteSize;
+pub use stats::MemoryStats;
+pub use tag::MemoryTag;
+pub use tracker::{MemoryReport, MemoryTracker, TagReport, global_tracker};
+pub use tracking::TrackingAllocator;

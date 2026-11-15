@@ -1,8 +1,8 @@
 # Memory
 
 `engine/rust/crates/memory` is the engine's memory layer. It is being built in milestones; this page describes what
-exists **today** (M1, the foundation, M2, arenas, and M3, the pool). Allocation tracking is planned and not implemented
-yet.
+exists **today** (M1, the foundation, M2, arenas, M3, the pool, and M4, tracking). The FFI counters for C++ (M5) are
+planned and not implemented yet.
 
 ## What is there
 
@@ -95,13 +95,62 @@ safe code (no `unsafe`).
 * **On an insert error the value is dropped.**
 * **Dependency.** The pool needs `ccore::Handle`, so `memory` depends on `ccore` (which has no dependency on `memory`).
 
+### Tracking (M4)
+
+Memory is counted in two independent ways that answer different questions.
+
+| Item                 | Purpose                                                                                                                                           |
+|:---------------------|:--------------------------------------------------------------------------------------------------------------------------------------------------|
+| `MemoryTag`          | The engine system a block belongs to: `General` (default), `Rendering`, `Assets`, `Ecs`, `Physics`, `Audio`, `Scripting`, `Ui`, `Networking`, `Tools`. |
+| `MemoryTracker`      | Counts *registered* memory per tag (`record_alloc`, `record_dealloc`, `stats`, `total`), with an advisory budget per tag (`set_budget`, `is_over_budget`) and `report()`. |
+| `global_tracker()`   | The process-wide `MemoryTracker`. `Bump::with_capacity_tagged` and `FrameArena::with_capacity_tagged` register their block in it for as long as they live. |
+| `MemoryStats`        | A snapshot of one set of counters: `current`, `peak`, `total_allocated`, `allocations`, `deallocations`, `reallocations`, `live_allocations()`.    |
+| `MemoryReport`       | The total plus one `TagReport` per used tag; `leaks()` lists the tags that still hold bytes, `over_budget()` those over their budget. Prints as plain text. |
+| `TrackingAllocator`  | Wraps a `GlobalAlloc` (the system's by default) and counts every Rust allocation of the process. Nothing installs it; a program opts in with `#[global_allocator]`. |
+
+```rust,ignore
+use memory::{Bump, ByteSize, MemoryTag, global_tracker};
+
+global_tracker().set_budget(MemoryTag::Rendering, Some(ByteSize::from_mib(64)));
+let frame_memory = Bump::with_capacity_tagged(1 << 20, MemoryTag::Rendering)?;
+// ... at shutdown:
+let report = global_tracker().report();
+for leak in report.leaks() {
+    eprintln!("not freed: {leak}");
+}
+
+// A program that wants process-wide numbers:
+use memory::TrackingAllocator;
+use std::alloc::System;
+#[global_allocator]
+static ALLOCATOR: TrackingAllocator<System> = TrackingAllocator::new(System);
+println!("{}", ALLOCATOR.stats());
+```
+
+What to know:
+
+* **Tags apply to registered memory only.** The global allocator is not told which system is allocating, so
+  `TrackingAllocator` has no per-tag numbers, and the tracker does not see memory nobody registered. Today the arenas
+  (`Bump`, `FrameArena`) can register; `Pool` does not, and neither does anything that C++ code or the operating system
+  allocates.
+* **`TrackingAllocator` sees Rust allocations only,** and it is cheap but not free: a few relaxed atomic operations per
+  allocation. It never allocates, locks or panics, which a global allocator must not do.
+* **Budgets only warn.** Going over a budget changes `is_over_budget()` and the report, nothing else: no allocation is
+  refused.
+* **A leak is a tag with bytes still in use when you ask.** Call `report()` at shutdown (or at the end of a level);
+  turning the report into log messages is the caller's job. The crate does not depend on `log-core`: emitting
+  diagnostics needs a registered producer and diagnostic codes, which belongs to the integration step (M5).
+* **Snapshots are approximately consistent** under load: the counters are read one after the other while other
+  threads may be allocating.
+
 ## Conventions
 
 * **No panics on bad input.** Sizes and alignments that come from outside are validated and reported as a
   `MemoryError`. `ByteSize` offers checked and saturating arithmetic only, no operators.
-* **`unsafe` in one private module.** The workspace denies `unsafe_code`; `bump` is allowed it, with the reason spelled
-  out in the `#[allow]`. Every `unsafe` block carries a safety comment, the invariants are listed at the top of the
-  module, and the public API is safe. `FrameArena` and `Pool` are plain safe code.
+* **`unsafe` in two private modules.** The workspace denies `unsafe_code`; `bump` (the arena memory) and `tracking`
+  (the `GlobalAlloc` implementation, which is an `unsafe trait`) are allowed it, with the reason spelled out in the
+  `#[allow]`. Every `unsafe` block carries a safety comment, the invariants of `bump` are listed at the top of the
+  module, and the public API is safe. `FrameArena`, `Pool`, `MemoryTracker` and the counters are plain safe code.
 * **One dependency (`ccore`, for `Handle`), stable Rust.** `allocator_api` is unstable, so allocators cannot be plugged into `Vec<T, A>`; the
   arenas hand out references and slices instead of depending on an allocator crate.
 
@@ -112,8 +161,8 @@ safe code (no `unsafe`).
 | M1        | `Alignment`, checked layouts, `ByteSize`, `MemoryError`                                   | done    |
 | M2        | `Bump` (with markers), `FrameArena`; the first `unsafe`                                   | done    |
 | M3        | `Pool<T>` with `ccore::Handle<T>`: stale handles are rejected                             | done    |
-| M4        | `MemoryTag`, atomic counters, opt-in `TrackingAllocator`, snapshots, budgets, leak report | planned |
-| M5        | FFI: `ffi_memory_stats` and a `cv-ffi` wrapper; optional C++ allocation hooks             | planned |
+| M4        | `MemoryTag`, atomic counters, opt-in `TrackingAllocator`, snapshots, budgets, leak report | done    |
+| M5        | FFI: `ffi_memory_stats` and a `cv-ffi` wrapper; optional C++ allocation hooks; the leak report as log diagnostics | planned |
 | M6        | criterion benchmarks, remaining docs                                                      | planned |
 
 There is no separate `StackArena`: a `Bump` with markers is the same thing. Out of scope for now: allocators for the

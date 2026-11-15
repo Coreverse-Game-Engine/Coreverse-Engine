@@ -27,6 +27,8 @@ use crate::align::Alignment;
 use crate::error::{MemoryError, MemoryResult};
 use crate::layout::{array_layout, layout_from_parts};
 use crate::size::ByteSize;
+use crate::tag::MemoryTag;
+use crate::tracker::global_tracker;
 
 /// Alignment of the memory block itself. Requests with a larger alignment are served by aligning the address
 /// inside the block, which wastes up to `align - BLOCK_ALIGN` bytes per request.
@@ -36,6 +38,8 @@ const BLOCK_ALIGN: usize = 16;
 struct Block {
     ptr: NonNull<u8>,
     layout: Layout,
+    /// The category the block is registered under in the global tracker, if any.
+    tag: Option<MemoryTag>,
 }
 
 // SAFETY: a `Block` owns its memory exclusively, like a `Box<[u8]>`; nothing else holds a pointer to it, so it can
@@ -44,7 +48,7 @@ struct Block {
 unsafe impl Send for Block {}
 
 impl Block {
-    fn new(capacity: usize) -> MemoryResult<Self> {
+    fn new(capacity: usize, tag: Option<MemoryTag>) -> MemoryResult<Self> {
         // Rejects capacities above `isize::MAX`.
         let layout = layout_from_parts(capacity, BLOCK_ALIGN)?;
 
@@ -53,15 +57,23 @@ impl Block {
             // it is never dereferenced.
             let dangling = std::ptr::without_provenance_mut::<u8>(BLOCK_ALIGN);
             let ptr = NonNull::new(dangling).unwrap_or(NonNull::dangling());
-            return Ok(Self { ptr, layout });
+            return Ok(Self {
+                ptr,
+                layout,
+                tag: None,
+            });
         }
 
         // SAFETY: `layout` has a non-zero size, because `capacity > 0`.
         let raw = unsafe { std::alloc::alloc(layout) };
-        match NonNull::new(raw) {
-            Some(ptr) => Ok(Self { ptr, layout }),
-            None => Err(MemoryError::AllocationFailed { size: capacity }),
+        let Some(ptr) = NonNull::new(raw) else {
+            return Err(MemoryError::AllocationFailed { size: capacity });
+        };
+
+        if let Some(tag) = tag {
+            global_tracker().record_alloc(tag, capacity);
         }
+        Ok(Self { ptr, layout, tag })
     }
 }
 
@@ -71,6 +83,10 @@ impl Drop for Block {
             // SAFETY: `ptr` came from `std::alloc::alloc` with exactly this `layout` (see `Block::new`) and has
             // not been freed; a block of size 0 was never allocated and is skipped above.
             unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
+
+            if let Some(tag) = self.tag {
+                global_tracker().record_dealloc(tag, self.layout.size());
+            }
         }
     }
 }
@@ -131,11 +147,42 @@ impl Bump {
     /// * [`MemoryError::SizeOverflow`] when `capacity` is larger than `isize::MAX`.
     /// * [`MemoryError::AllocationFailed`] when the system allocator cannot provide the block.
     pub fn with_capacity(capacity: usize) -> MemoryResult<Self> {
+        Self::from_block(Block::new(capacity, None)?)
+    }
+
+    /// Like [`Bump::with_capacity`], and registers the block under `tag` in the [`global_tracker`] for as long as the
+    /// allocator lives: the capacity counts as in use, the block as one allocation. A capacity of 0 is not
+    /// registered.
+    ///
+    /// ```
+    /// use memory::{Bump, MemoryTag, global_tracker};
+    ///
+    /// let before = global_tracker().stats(MemoryTag::Ui).current;
+    /// let bump = Bump::with_capacity_tagged(4096, MemoryTag::Ui)?;
+    /// assert_eq!(global_tracker().stats(MemoryTag::Ui).current.bytes(), before.bytes() + 4096);
+    /// drop(bump);
+    /// assert_eq!(global_tracker().stats(MemoryTag::Ui).current, before);
+    /// # Ok::<(), memory::MemoryError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`Bump::with_capacity`].
+    pub fn with_capacity_tagged(capacity: usize, tag: MemoryTag) -> MemoryResult<Self> {
+        Self::from_block(Block::new(capacity, Some(tag))?)
+    }
+
+    fn from_block(block: Block) -> MemoryResult<Self> {
         Ok(Self {
-            block: Block::new(capacity)?,
+            block,
             offset: Cell::new(0),
             peak: Cell::new(0),
         })
+    }
+
+    /// The category the block is registered under, or `None` for an untracked allocator.
+    pub fn tag(&self) -> Option<MemoryTag> {
+        self.block.tag
     }
 
     /// Like [`Bump::with_capacity`], for a capacity given as a [`ByteSize`].
@@ -353,6 +400,33 @@ mod tests {
         assert_eq!(bump.used(), 0);
         assert_eq!(bump.remaining(), 256);
         assert_eq!(bump.peak(), 0);
+    }
+
+    #[test]
+    fn a_tagged_allocator_registers_its_block_in_the_global_tracker() {
+        // No other unit test of this crate uses `MemoryTag::Audio`, so the counters are ours alone.
+        let tracker = global_tracker();
+        let before = tracker.stats(MemoryTag::Audio);
+
+        let bump = Bump::with_capacity_tagged(1024, MemoryTag::Audio).unwrap();
+        assert_eq!(bump.tag(), Some(MemoryTag::Audio));
+        let during = tracker.stats(MemoryTag::Audio);
+        assert_eq!(during.current.bytes(), before.current.bytes() + 1024);
+        assert_eq!(during.allocations, before.allocations + 1);
+
+        drop(bump);
+        let after = tracker.stats(MemoryTag::Audio);
+        assert_eq!(after.current, before.current);
+        assert_eq!(after.deallocations, before.deallocations + 1);
+        assert!(after.peak.bytes() >= before.current.bytes() + 1024);
+    }
+
+    #[test]
+    fn an_untagged_allocator_and_an_empty_one_register_nothing() {
+        assert_eq!(Bump::with_capacity(64).unwrap().tag(), None);
+        // A zero capacity has no block to register.
+        let empty = Bump::with_capacity_tagged(0, MemoryTag::Audio).unwrap();
+        assert_eq!(empty.capacity(), 0);
     }
 
     #[test]
