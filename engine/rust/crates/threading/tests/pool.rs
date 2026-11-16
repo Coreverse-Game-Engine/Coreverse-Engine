@@ -52,17 +52,23 @@ fn many_jobs_all_run_exactly_once() {
 #[test]
 fn one_worker_runs_jobs_in_submission_order() {
     let pool = pool_with(1);
-    let order = Arc::new(Mutex::new(Vec::new()));
+    let (log, order) = mpsc::channel();
     let handles: Vec<_> = (0..50)
         .map(|n| {
-            let order = Arc::clone(&order);
-            pool.spawn(move || order.lock().unwrap().push(n))
+            let log = log.clone();
+            pool.spawn(move || log.send(n).unwrap())
         })
         .collect();
+    // The test thread must not call `wait` before the jobs are done: a waiting thread helps by running queued
+    // jobs itself, and two threads running jobs at the same time can log them out of order. Receiving from a
+    // channel keeps every job on the one worker.
+    let seen: Vec<i32> = (0..50)
+        .map(|_| order.recv_timeout(PATIENCE).expect("the job ran"))
+        .collect();
+    assert_eq!(seen, (0..50).collect::<Vec<_>>());
     for handle in handles {
         handle.wait();
     }
-    assert_eq!(*order.lock().unwrap(), (0..50).collect::<Vec<_>>());
 }
 
 #[test]

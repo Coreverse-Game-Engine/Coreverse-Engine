@@ -28,6 +28,11 @@ pub enum ThreadingError {
         #[source]
         source: std::io::Error,
     },
+
+    /// The pool has finished shutting down and accepts no more jobs. Only a [`Spawner`](crate::Spawner) can
+    /// run into this: a [`ThreadPool`](crate::ThreadPool) cannot be used after it has shut down.
+    #[error("the thread pool has shut down")]
+    PoolClosed,
 }
 
 /// Shorthand for `Result<T, ThreadingError>`.
@@ -39,6 +44,7 @@ impl From<ThreadingError> for CoreError {
         match err {
             ThreadingError::InvalidConfig { .. } => CoreError::InvalidArgument(message),
             ThreadingError::Spawn { .. } => CoreError::Io(message),
+            ThreadingError::PoolClosed => CoreError::InvalidState(message),
         }
     }
 }
@@ -83,5 +89,7 @@ mod tests {
         }
         .into();
         assert!(matches!(spawn, CoreError::Io(_)));
+        let closed: CoreError = ThreadingError::PoolClosed.into();
+        assert!(matches!(closed, CoreError::InvalidState(_)));
     }
 }
