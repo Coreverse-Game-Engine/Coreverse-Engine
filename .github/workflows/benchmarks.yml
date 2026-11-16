@@ -2,7 +2,7 @@ name: Benchmarks
 
 # Manual only: benchmark numbers from shared CI runners are too noisy to gate
 # anything on. Runs every criterion suite in the workspace - today that is
-# `math` (engine/rust/crates/math/benches). The `benchmarks/` directory at the
+# `math` and `memory` (engine/rust/crates/*/benches). The `benchmarks/` directory at the
 # repository root is still a placeholder for future cross-crate suites.
 on:
     workflow_dispatch:

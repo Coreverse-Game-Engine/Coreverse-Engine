@@ -3,7 +3,7 @@
 //!
 //! # What is here today
 //!
-//! **M1, the foundation.** No dependencies, no `unsafe` code:
+//! **M1, the foundation.** No `unsafe` code, nothing that needs a dependency:
 //!
 //! * [`Alignment`]: a validated power-of-two alignment with `align_up`, `align_down` and padding arithmetic.
 //! * [`layout_from_parts`] and [`array_layout`]: checked construction of [`core::alloc::Layout`] from sizes and
@@ -12,7 +12,7 @@
 //!   for budgets, limits and statistics.
 //! * [`MemoryError`] and [`MemoryResult`].
 //!
-//! **M2, arenas.** The first (and only) `unsafe` code of the crate, in the private `bump` module:
+//! **M2, arenas.** The first `unsafe` code of the crate, in the private `bump` module:
 //!
 //! * [`Bump`]: a fixed-capacity bump allocator for `Copy` values. Allocating takes `&self` and returns a reference;
 //!   freeing ([`Bump::reset`], [`Bump::rewind`] to a [`Marker`]) takes `&mut self`, so the compiler rejects every use
@@ -78,10 +78,18 @@
 //! # Ok::<(), memory::MemoryError>(())
 //! ```
 //!
-//! # What is planned
+//! **M5, the C++ side.** Not in this crate: the `ffi` crate exposes the [`global_tracker`] to C++ (`ffi_memory_*`) and
+//! turns the [`MemoryReport`] into log diagnostics, and `cv-ffi` wraps it in `cv_ffi::memory` (`TrackedAllocation`, a
+//! `std::pmr` resource that registers its allocations). This crate does not depend on either.
 //!
-//! The FFI counters for C++ (M5) do not exist yet, and nothing here is stable API before the crate leaves its early
-//! milestones.
+//! **M6, benchmarks.** `cargo bench -p memory` (criterion): the arenas against the heap, the pool, the counters and
+//! the overhead of the [`TrackingAllocator`].
+//!
+//! # What is not here
+//!
+//! Allocators for the ECS (archetype chunks) and for the job system (thread-local scratch space), a double-buffered
+//! frame arena and arenas that grow: nothing needs them yet, and each would change the design (see the page on
+//! memory in the book). The API of this crate may still change while the systems that use it are written.
 //!
 //! # Conventions
 //!

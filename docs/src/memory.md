@@ -1,8 +1,8 @@
 # Memory
 
 `engine/rust/crates/memory` is the engine's memory layer. It is being built in milestones; this page describes what
-exists **today** (M1, the foundation, M2, arenas, M3, the pool, M4, tracking, and M5, the C++ side). Only the
-benchmarks (M6) are still to do.
+exists (M1, the foundation, M2, arenas, M3, the pool, M4, tracking, M5, the C++ side, and M6, benchmarks). All planned
+milestones are done; what is deliberately left out is listed at the end of the page.
 
 ## What is there
 
@@ -130,16 +130,16 @@ println!("{}", ALLOCATOR.stats());
 What to know:
 
 * **Tags apply to registered memory only.** The global allocator is not told which system is allocating, so
-  `TrackingAllocator` has no per-tag numbers, and the tracker does not see memory nobody registered. Today the arenas
-  (`Bump`, `FrameArena`) can register; `Pool` does not, and neither does anything that C++ code or the operating system
-  allocates.
+  `TrackingAllocator` has no per-tag numbers, and the tracker does not see memory nobody registered. The arenas
+  (`Bump`, `FrameArena`) can register, and C++ code can register through the FFI (see below); `Pool` does not, and the
+  operating system's own allocations cannot be seen.
 * **`TrackingAllocator` sees Rust allocations only,** and it is cheap but not free: a few relaxed atomic operations per
   allocation. It never allocates, locks or panics, which a global allocator must not do.
 * **Budgets only warn.** Going over a budget changes `is_over_budget()` and the report, nothing else: no allocation is
   refused.
 * **A leak is a tag with bytes still in use when you ask.** Call `report()` at shutdown (or at the end of a level);
-  turning the report into log messages is the caller's job. The crate does not depend on `log-core`: emitting
-  diagnostics needs a registered producer and diagnostic codes, which belongs to the integration step (M5).
+  the crate itself does not depend on `log-core`: the report is a value with `Display`, and the `ffi` crate turns it
+  into log diagnostics (see below).
 * **Snapshots are approximately consistent** under load: the counters are read one after the other while other
   threads may be allocating.
 
@@ -159,6 +159,27 @@ it in `cv_ffi::memory`:
   memory show up in one place.
 
 The `TrackingAllocator` is not part of this interface: it is a global allocator, which the executable chooses.
+
+### Benchmarks (M6)
+
+```bash
+cargo bench -p memory
+```
+
+`engine/rust/crates/memory/benches/memory_bench.rs` (criterion) measures, with every input passed through `black_box`:
+
+| Benchmark                                                         | Compares                                                                            |
+|:------------------------------------------------------------------|:------------------------------------------------------------------------------------|
+| `bump/alloc_usize_x1000` against `heap/box_usize_x1000`           | 1000 small values from an arena that is reset each iteration, against 1000 `Box`es  |
+| `bump/alloc_slice_fill_256_f32` against `heap/vec_256_f32`        | one 256-element slice from the arena against a `Vec`                                |
+| `frame_arena/frame_of_100_allocs`                                 | `begin_frame` plus 100 allocations (the per-frame pattern)                          |
+| `pool/insert_then_remove_x1000`, `pool/get_x1000`                 | 1000 inserts and removals in a pre-sized pool, and 1000 handle lookups              |
+| `tracker/record_alloc_and_dealloc`                                | the cost of registering one allocation and its release under a tag                  |
+| `allocator/system_alloc_dealloc_64` against `allocator/tracking_alloc_dealloc_64` | the overhead of counting: the same 64-byte allocation with and without the `TrackingAllocator` |
+
+No figures are given here on purpose: they depend on the machine and on the platform's allocator, so compare the
+benchmarks of one run with each other. The CI workflow `benchmarks.yml` (manual) runs `cargo bench --workspace`, which
+includes this suite.
 
 ## Conventions
 
@@ -180,8 +201,19 @@ The `TrackingAllocator` is not part of this interface: it is a global allocator,
 | M3        | `Pool<T>` with `ccore::Handle<T>`: stale handles are rejected                             | done    |
 | M4        | `MemoryTag`, atomic counters, opt-in `TrackingAllocator`, snapshots, budgets, leak report | done    |
 | M5        | FFI: `ffi_memory_*` and the `cv_ffi::memory` wrapper; C++ allocation hooks; the leak report as log diagnostics | done    |
-| M6        | criterion benchmarks, remaining docs                                                      | planned |
+| M6        | criterion benchmarks, remaining docs                                                      | done    |
 
-There is no separate `StackArena`: a `Bump` with markers is the same thing. Out of scope for now: allocators for the
-ECS (archetype chunks) and for the job system (thread-local scratch space); they will be designed together with `ecs`
-and `threading`.
+## Left out on purpose
+
+* **`StackArena`.** A `Bump` with markers is the same thing.
+* **A double-buffered `FrameArena`.** A reference cannot cross `begin_frame`; data that must outlive a frame needs
+  handles or offsets, which no system has asked for.
+* **Arenas that grow.** The capacity is fixed so that a frame's budget is a number; `peak()` tells what to set.
+* **Allocators for the ECS (archetype chunks) and the job system (thread-local scratch space).** They will be designed
+  together with `ecs` and `threading`.
+* **Registering `Pool` with the tracker**, and tracking by the global allocator per tag (the allocator is not told who
+  is allocating).
+* **Refusing allocations over a budget.** Budgets only warn.
+* **Replacing `operator new`/`operator delete` in C++.** Only memory that goes through `TrackedAllocation` or
+  `TrackingResource` is counted.
+* **Installing the `TrackingAllocator` from a library.** The executable chooses its global allocator.

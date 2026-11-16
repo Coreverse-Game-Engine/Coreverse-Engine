@@ -835,6 +835,7 @@ name = "memory"
 version = "0.1.0"
 dependencies = [
  "ccore",
+ "criterion",
 ]
 
 [[package]]

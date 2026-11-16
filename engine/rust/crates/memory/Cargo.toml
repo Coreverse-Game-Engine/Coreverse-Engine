@@ -1,6 +1,6 @@
 [package]
 name = "memory"
-description = "Coreverse's memory layer: alignment, size and layout helpers and bump and frame arenas, and a generational pool today; memory tracking is planned"
+description = "Coreverse's memory layer: alignment, size and layout helpers, bump and frame arenas, a generational pool and memory tracking with budgets"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
@@ -8,6 +8,13 @@ license.workspace = true
 
 [dependencies]
 ccore = { path = "../ccore" }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "memory_bench"
+harness = false
 
 [lints]
 workspace = true

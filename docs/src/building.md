@@ -39,6 +39,7 @@ the Vulkan validation layer is not running.
 
 ```bash
 cargo bench -p math
+cargo bench -p memory
 ```
 
 ## Format
