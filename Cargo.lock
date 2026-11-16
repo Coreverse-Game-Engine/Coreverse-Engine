@@ -488,6 +488,7 @@ dependencies = [
  "ccore",
  "log-core",
  "log-sinks",
+ "memory",
  "platform",
  "vfs",
 ]
@@ -832,6 +833,10 @@ dependencies = [
 [[package]]
 name = "memory"
 version = "0.1.0"
+dependencies = [
+ "ccore",
+ "criterion",
+]
 
 [[package]]
 name = "ndk"

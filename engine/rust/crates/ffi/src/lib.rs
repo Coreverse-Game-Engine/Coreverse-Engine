@@ -78,6 +78,12 @@ pub mod vfs;
 /// thread-local last-error convention as `vfs`; see the module docs.
 pub mod platform;
 
+/// Memory FFI surface: the per-tag counters, budgets and report of the
+/// `memory` crate's global tracker, so C++ can register what it allocates, plus
+/// the leak and budget report as log diagnostics. No opaque handle, no
+/// last-error slot; see the module docs.
+pub mod memory;
+
 /// The window event loop for C++: `ffi_platform_run`, the callback table
 /// ([`platform_run::PlatformCallbacks`]), the window events and the
 /// `ffi_platform_ctx_*` functions a callback uses to create windows, redraw,

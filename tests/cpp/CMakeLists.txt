@@ -80,6 +80,16 @@ target_link_libraries(cv_ffi_platform_test PRIVATE cv-ffi::cv-ffi compiler_warni
 add_test(NAME cv_ffi_platform_test COMMAND cv_ffi_platform_test)
 set_tests_properties(cv_ffi_platform_test PROPERTIES ${CV_FFI_TEST_PROPERTIES})
 
+# Memory (M5) proof: cv-ffi's memory wrappers -- the per-tag counters,
+# TrackedAllocation, the TrackingResource (std::pmr) allocation hook, budgets,
+# the text report and the leak/budget report as log diagnostics -- against the
+# real Rust library.
+add_executable(cv_ffi_memory_test cv_ffi_memory_test.cpp)
+target_link_libraries(cv_ffi_memory_test PRIVATE cv-ffi::cv-ffi compiler_warnings)
+
+add_test(NAME cv_ffi_memory_test COMMAND cv_ffi_memory_test)
+set_tests_properties(cv_ffi_memory_test PROPERTIES ${CV_FFI_TEST_PROPERTIES})
+
 # Phase 10 (runtime integration) proof: cv-ffi's window event loop --
 # cv_ffi::window::Run() and the Context -- against the real Rust library on
 # the headless backend (no display needed): callback order, exit codes, the
