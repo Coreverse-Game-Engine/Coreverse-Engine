@@ -1,12 +1,15 @@
 [package]
 name = "threading"
-description = "Placeholder for the engine's job/task system and thread pools; not yet implemented"
+description = "Coreverse's job system: a thread pool with job handles, panic propagation and a single-threaded mode (foundation milestone T1)"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+ccore = { path = "../ccore" }
+platform = { path = "../platform" }
+thiserror.workspace = true
 
 [lints]
 workspace = true

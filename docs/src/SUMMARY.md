@@ -10,5 +10,6 @@
 - [Rendering](rendering.md)
 - [Math](math.md)
 - [Memory](memory.md)
+- [Threading](threading.md)
 - [Editor](editor.md)
 - [Continuous integration](ci.md)
