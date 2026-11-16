@@ -1,8 +1,8 @@
 # Memory
 
 `engine/rust/crates/memory` is the engine's memory layer. It is being built in milestones; this page describes what
-exists **today** (M1, the foundation, M2, arenas, M3, the pool, and M4, tracking). The FFI counters for C++ (M5) are
-planned and not implemented yet.
+exists **today** (M1, the foundation, M2, arenas, M3, the pool, M4, tracking, and M5, the C++ side). Only the
+benchmarks (M6) are still to do.
 
 ## What is there
 
@@ -143,6 +143,23 @@ What to know:
 * **Snapshots are approximately consistent** under load: the counters are read one after the other while other
   threads may be allocating.
 
+### C++ side (M5)
+
+The `ffi` crate exposes the global tracker to C++ (`ffi_memory_*`, see [Rust and C++ FFI](ffi.md)), and `cv-ffi` wraps
+it in `cv_ffi::memory`:
+
+* `RecordAlloc`/`RecordDealloc`, `TagStats`/`TotalStats`, budgets and `Report()`: the tracker's functions, with the same
+  tags (`cv_ffi::memory::Tag`, mirrored by `static_assert`s).
+* `TrackedAllocation`: a move-only RAII registration for a block C++ owns.
+* `TrackingResource`: a `std::pmr::memory_resource` that registers every allocation under a tag and forwards to an
+  upstream resource. This is the allocation hook for C++: hand it to a `std::pmr` container. `operator new` and
+  `operator delete` are not replaced.
+* `EmitReport(logger)`: the leak and budget report as log diagnostics (`CV-MEMORY-LEAK-<n>` and
+  `CV-MEMORY-BUDGET-<n>`, warnings). The report is built in Rust and emitted through the Rust logger, so Rust and C++
+  memory show up in one place.
+
+The `TrackingAllocator` is not part of this interface: it is a global allocator, which the executable chooses.
+
 ## Conventions
 
 * **No panics on bad input.** Sizes and alignments that come from outside are validated and reported as a
@@ -162,7 +179,7 @@ What to know:
 | M2        | `Bump` (with markers), `FrameArena`; the first `unsafe`                                   | done    |
 | M3        | `Pool<T>` with `ccore::Handle<T>`: stale handles are rejected                             | done    |
 | M4        | `MemoryTag`, atomic counters, opt-in `TrackingAllocator`, snapshots, budgets, leak report | done    |
-| M5        | FFI: `ffi_memory_stats` and a `cv-ffi` wrapper; optional C++ allocation hooks; the leak report as log diagnostics | planned |
+| M5        | FFI: `ffi_memory_*` and the `cv_ffi::memory` wrapper; C++ allocation hooks; the leak report as log diagnostics | done    |
 | M6        | criterion benchmarks, remaining docs                                                      | planned |
 
 There is no separate `StackArena`: a `Bump` with markers is the same thing. Out of scope for now: allocators for the

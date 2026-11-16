@@ -23,6 +23,7 @@ add_library(cv-ffi STATIC
         src/Diagnostic.cpp
         src/Vfs.cpp
         src/Platform.cpp
+        src/Memory.cpp
         src/Keys.cpp
         src/Window.cpp
 )

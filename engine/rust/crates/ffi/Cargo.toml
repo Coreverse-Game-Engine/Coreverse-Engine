@@ -22,6 +22,9 @@ vfs-crate = { package = "vfs", path = "../vfs" }
 # Renamed on import for the same reason as `vfs-crate`: this crate has its
 # own `platform` FFI module (src/platform.rs).
 platform-crate = { package = "platform", path = "../platform" }
+# Renamed on import for the same reason as `platform-crate`: this crate has its
+# own `memory` FFI module (src/memory.rs).
+memory-crate = { package = "memory", path = "../memory" }
 camino.workspace = true
 
 # The window backend (`winit`) for `ffi_platform_run`: desktop windows on

@@ -488,6 +488,7 @@ dependencies = [
  "ccore",
  "log-core",
  "log-sinks",
+ "memory",
  "platform",
  "vfs",
 ]
