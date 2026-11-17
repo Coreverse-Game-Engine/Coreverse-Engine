@@ -1,8 +1,8 @@
 //! `threading` — the job system of the Coreverse Engine: a thread pool that runs closures as jobs and gets
 //! their results (or panics) back to the code that spawned them.
 //!
-//! The crate is built in milestones. This is **T2: per-worker queues with stealing, job priorities and
-//! spawners**, on top of the T1 foundation; scoped jobs, parallel loops, dependencies and dedicated threads
+//! The crate is built in milestones. This is **T3: scoped jobs and parallel loops**, on top of T1 (the
+//! foundation) and T2 (queues, stealing, priorities, spawners); dependencies between jobs and dedicated threads
 //! follow (see `docs/src/threading.md`).
 //!
 //! # What is here today
@@ -21,6 +21,16 @@
 //! * [`Spawner`] ([`ThreadPool::spawner`]): a cloneable handle that spawns jobs without owning the pool; this
 //!   is what a job carries to start more jobs. A job spawned from a worker goes into that worker's own queue.
 //! * [`worker_index`]: which worker the calling thread is, if any.
+//! * [`ThreadPool::scope`] and [`Scope::spawn`]: jobs that **borrow from the caller's stack** (no `Arc`, no
+//!   `'static`). The scope waits for all of them, so the borrows are sound; a panic in a job is re-raised
+//!   after all jobs finished.
+//! * [`ThreadPool::join`]: run two closures, possibly in parallel, and get both results.
+//! * [`ThreadPool::parallel_for`], [`parallel_chunks`](ThreadPool::parallel_chunks),
+//!   [`parallel_for_each`](ThreadPool::parallel_for_each),
+//!   [`parallel_for_each_mut`](ThreadPool::parallel_for_each_mut) and
+//!   [`parallel_chunks_mut`](ThreadPool::parallel_chunks_mut): data-parallel loops over index ranges and
+//!   slices, with chunk boundaries that do not depend on scheduling. A [`Spawner`] has the same operations,
+//!   so a job can parallelize its own work.
 //! * Help while waiting: a thread that waits for a job runs queued jobs instead of sleeping, so a job that
 //!   waits for another job cannot deadlock a small pool.
 //! * [`WorkerCount::Exact(0)`](WorkerCount::Exact): a pool with no threads at all. Jobs then run on the thread
@@ -39,9 +49,11 @@
 //!
 //! # Conventions
 //!
-//! * No `unsafe` code, and `std` only (no `no_std` mode).
-//! * Job closures are `Send + 'static` in this milestone. Jobs that borrow from the caller's stack arrive with
-//!   scoped jobs.
+//! * `std` only (no `no_std` mode). The crate has exactly one `unsafe` block, in the private `scope` module
+//!   (it hides the lifetime of a scoped job from the queues); the module documents the invariants that make
+//!   it sound, and the public API is safe.
+//! * Jobs started with [`ThreadPool::spawn`] are `Send + 'static`; jobs that borrow from the caller use
+//!   [`ThreadPool::scope`].
 //! * A `Mutex` of this crate is never held while job code runs, so a job cannot deadlock the pool by what it
 //!   does inside its closure.
 //!
@@ -51,9 +63,15 @@
 mod config;
 mod error;
 mod job;
+mod parallel;
 mod pool;
 mod priority;
 mod queue;
+#[allow(
+    unsafe_code,
+    reason = "scoped jobs hide the lifetime of the data they borrow from the pool's queues; the module documents the invariants that make this sound, the single unsafe block carries a safety comment, and the public API is safe"
+)]
+mod scope;
 mod sleep;
 mod sync;
 mod worker;
@@ -64,4 +82,5 @@ pub use job::{JobHandle, JobPanic};
 pub use platform::thread::ThreadPriority;
 pub use pool::{Spawner, ThreadPool};
 pub use priority::JobPriority;
+pub use scope::Scope;
 pub use worker::worker_index;

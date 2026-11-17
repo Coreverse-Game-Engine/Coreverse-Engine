@@ -23,6 +23,7 @@ static NEXT_POOL_ID: AtomicUsize = AtomicUsize::new(0);
 /// What the workers, the pool, the spawners and the job handles share.
 pub(crate) struct Shared {
     id: usize,
+    worker_count: usize,
     queues: Queues,
     sleep: Sleep,
     /// Set once, when the pool is dropped: the workers finish the queues and leave.
@@ -33,6 +34,7 @@ impl Shared {
     fn new(workers: usize) -> Self {
         Self {
             id: NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed),
+            worker_count: workers,
             queues: Queues::new(workers),
             sleep: Sleep::new(),
             shutting_down: AtomicBool::new(false),
@@ -59,16 +61,37 @@ impl Shared {
             completion.complete(result);
         });
 
-        match worker::index_in(self.id) {
-            Some(index) => self.queues.push_local(index, priority, task),
-            None => {
-                if self.queues.push_external(priority, task).is_err() {
-                    return Err(ThreadingError::PoolClosed);
-                }
-            }
+        if self.submit(priority, task).is_err() {
+            return Err(ThreadingError::PoolClosed);
         }
-        self.sleep.wake_one();
         Ok(JobHandle::new(slot, Arc::clone(self)))
+    }
+
+    /// Queues a task and wakes a sleeping worker. A task from one of this pool's own workers goes into that
+    /// worker's queue; every other task goes into the shared queue, which refuses it (and gives it back) once the
+    /// pool has shut down.
+    pub(crate) fn submit(&self, priority: JobPriority, task: Task) -> Result<(), Task> {
+        let result = match worker::index_in(self.id) {
+            Some(index) => {
+                self.queues.push_local(index, priority, task);
+                Ok(())
+            }
+            None => self.queues.push_external(priority, task),
+        };
+        if result.is_ok() {
+            self.sleep.wake_one();
+        }
+        result
+    }
+
+    /// The number of worker threads.
+    pub(crate) fn worker_count(&self) -> usize {
+        self.worker_count
+    }
+
+    /// Whether any job is counted as queued. `true` can also mean "being pushed right now".
+    pub(crate) fn has_queued(&self) -> bool {
+        self.queues.queued() > 0
     }
 
     /// Runs one queued job on the calling thread. `false` when nothing was queued.
@@ -116,7 +139,7 @@ impl Shared {
 /// # Ok::<(), threading::ThreadingError>(())
 /// ```
 pub struct ThreadPool {
-    shared: Arc<Shared>,
+    pub(crate) shared: Arc<Shared>,
     workers: Vec<JoinHandle<()>>,
     worker_count: usize,
     name_prefix: String,
@@ -276,7 +299,7 @@ impl fmt::Debug for ThreadPool {
 /// ```
 #[derive(Clone)]
 pub struct Spawner {
-    shared: Arc<Shared>,
+    pub(crate) shared: Arc<Shared>,
 }
 
 impl Spawner {

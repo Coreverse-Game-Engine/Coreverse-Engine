@@ -1,16 +1,19 @@
 # Threading
 
 `engine/rust/crates/threading` is the engine's job system. It is being built in milestones; this page describes what
-exists (T1, the foundation, and T2, queues, priorities and spawners) and what is planned. The crate uses `std` only and,
-so far, no `unsafe` code.
+exists (T1 foundation, T2 queues/priorities/spawners, T3 scoped jobs and parallel loops) and what is planned. The crate
+uses `std` only and has one `unsafe` block (see "Scoped jobs" below).
 
-## What is there (T1 and T2)
+## What is there (T1, T2 and T3)
 
 | Item                                | Purpose                                                                                                                                              |
 |:------------------------------------|:-----------------------------------------------------------------------------------------------------------------------------------------------------|
 | `ThreadPool`                        | A pool of named worker threads with a queue per worker and a shared queue for outside jobs. `new(config)`, `spawn(closure)`, `spawn_with_priority(priority, closure)`, `spawner()`, `run_pending()`, `shutdown()`, `worker_count()`, `pending_jobs()`. |
 | `JobPriority`                       | `Low`, `Normal` (default), `High`. Strict: a higher priority always starts first.                                                                    |
-| `Spawner`                           | A cloneable handle that spawns jobs without owning the pool; what a job carries to start more jobs. Fails with `PoolClosed` after shutdown.          |
+| `Spawner`                           | A cloneable handle that spawns jobs without owning the pool; what a job carries to start more jobs. Fails with `PoolClosed` after shutdown. Also has `scope`, `join` and the `parallel_*` operations. |
+| `Scope`, `ThreadPool::scope`        | Scoped jobs: `scope.spawn(...)` may borrow from the surrounding code; `scope` returns when all of them are done.                                      |
+| `join`                              | `pool.join(a, b)`: `a` on this thread, `b` as a job; both results back; both may borrow.                                                               |
+| `parallel_*`                        | `parallel_for(range, f)`, `parallel_chunks(range, chunk, f)`, `parallel_for_each(slice, f)`, `parallel_for_each_mut(slice, f)`, `parallel_chunks_mut(slice, chunk, f)`. |
 | `worker_index()`                    | The index of the calling thread among its pool's workers, or `None` on any other thread.                                                              |
 | `PoolConfig`, `WorkerCount`         | The settings: worker count (`Auto` or `Exact(n)`), thread name prefix, thread priority. Chained `with_*` setters, `validate()`.                       |
 | `JobHandle<T>`                      | What `spawn` returns: `is_done()`, `wait()` (re-raises a panic), `wait_catch()` (returns the panic as a value).                                      |
@@ -38,6 +41,20 @@ let report = pool.spawn_with_priority(JobPriority::High, move || {
     Ok::<_, ThreadingError>(part.wait() + 1)
 });
 assert_eq!(report.wait()?, 21);
+
+// Scoped jobs borrow from the stack: no `Arc`, no `'static`.
+let mut squares = vec![0_u64; 8];
+pool.scope(|scope| {
+    for (n, slot) in squares.iter_mut().enumerate() {
+        scope.spawn(move || *slot = (n * n) as u64);
+    }
+});
+
+// Data-parallel loops.
+let total = std::sync::atomic::AtomicU64::new(0);
+pool.parallel_for(0..1_000, |i| {
+    total.fetch_add(i as u64, std::sync::atomic::Ordering::Relaxed);
+});
 
 // Dropping the pool (or `pool.shutdown()`) finishes the queued jobs, then joins the workers.
 ```
@@ -91,17 +108,57 @@ assert_eq!(report.wait()?, 21);
   instead of propagating a panic.
 * **Closures are `Send + 'static`.** Jobs that borrow from the caller's stack need scoped jobs (T3).
 
+## Scoped jobs, `join` and the parallel loops (T3)
+
+* **`scope`.** `pool.scope(|scope| { scope.spawn(|| ...); })` runs jobs that may borrow anything that outlives the
+  call. It returns the body's value, but only after every job spawned in it has run to the end and been dropped.
+  While it waits, the calling thread runs queued jobs itself (so it works with no workers). A job may spawn more
+  jobs through the `&Scope` it captured. `scope.spawn` returns nothing: hand results back through what the job
+  borrows (a `&mut` element, an atomic, a `Mutex`) or use `join`.
+* **Panics.** A panicking job does not stop the others. When all are done, the scope re-raises the first job panic.
+  If the body itself panics, the jobs are still waited for first and the body's panic wins. Nothing is cancelled.
+* **`join(a, b)`.** `a` runs on the calling thread, `b` as a scoped job. Because a job spawned by a job on a worker
+  goes into that worker's own queue and the worker takes its newest job back first, an unstolen `b` is simply run by
+  the caller after `a`: a `join` that nobody helps costs little more than a function call and an allocation.
+* **Loops.** `parallel_for`, `parallel_for_each` and `parallel_for_each_mut` cut the work into about four chunks per
+  thread. `parallel_chunks` and `parallel_chunks_mut` use the chunk size you give, with the boundaries of
+  `slice::chunks` (the last chunk may be shorter), no matter how the work is scheduled; `parallel_chunks_mut` passes the
+  index of the chunk's first item. Chunks are handed out by splitting in halves with `join`, so the order of the calls
+  is unspecified. Slices are split with `split_at(_mut)`, so no two jobs ever share an item (this part is safe code).
+  Choose a chunk size so that one chunk is worth a job (some microseconds of work). A chunk size of 0 panics.
+* **From inside a job.** Use the job's `Spawner`: it has the same `scope`, `join` and `parallel_*` operations. They
+  also work after the pool has shut down, then on the calling thread alone.
+
+### Why the `unsafe` block is sound
+
+The queues hold `'static` jobs, so a scoped job's borrowed lifetime has to be hidden from them (`mem::transmute` of
+`Box<dyn FnOnce() + Send + 'a>` to `'static`, in `scope.rs`: the only `unsafe` in the crate). That is sound because
+the scope never lets the borrowed data go while a job can still touch it:
+
+1. every job owns a guard that counts it as pending until the job is dropped;
+2. the job is declared before the guard in its struct, so the job and everything it captured are dropped first;
+3. `scope` waits for the count to reach 0 before it returns or unwinds (the body runs inside `catch_unwind`; if the
+   wait itself ever unwound, an abort guard stops the process instead of freeing the stack frame under the jobs);
+4. the counter lives under a mutex, so the jobs' writes are visible to the caller when it returns;
+5. `'scope` is invariant and higher-ranked, as in `std::thread::scope`, so a `&Scope` cannot escape and a job can only
+   borrow data that outlives the whole call.
+
+The compiler rejects the misuse cases (a job borrowing something that dies with the body, a `&Scope` escaping,
+two jobs borrowing the same variable mutably, reading what a job may change, capturing a non-`Send` value, using a
+value after moving it into a job); each is a `compile_fail` doc test on `Scope`. Miri is not run on this crate yet (see
+the roadmap).
+
 ## Roadmap
 
 | Milestone | Content                                                                                                                                             |
 |:----------|:----------------------------------------------------------------------------------------------------------------------------------------------------|
 | T1        | Done: pool, `spawn`, `JobHandle`, panic propagation, shutdown, single-threaded mode, help while waiting.                                            |
 | T2        | Done: per-worker queues with stealing, three priorities (`High`/`Normal`/`Low`), `Spawner` for jobs that spawn jobs, `worker_index()`.              |
-| T3        | `scope`, `join`, `parallel_for`, `parallel_chunks`, `parallel_for_each`: jobs that borrow from the stack. The first `unsafe` module of the crate.   |
+| T3        | Done: `scope`, `join`, `parallel_for`, `parallel_chunks`, `parallel_for_each` (and `_mut` variants): jobs that borrow from the stack. The first `unsafe` module of the crate. |
 | T4        | Dependencies between jobs (`then`, counters) and a `TaskGraph` with cycle detection, for the ECS scheduler.                                         |
 | T5        | Dedicated threads (render, audio), a separate IO pool for blocking work, a main-thread marker and `ThreadRole` assertions.                          |
 | T6        | Observer hooks for the profiler, per-worker statistics, per-worker scratch arenas on top of `memory`.                                               |
-| T7        | criterion benchmarks, the rest of the documentation, optional Miri/loom job.                                                                        |
+| T7        | criterion benchmarks, the rest of the documentation, an optional Miri/loom job (the `scope` module is what it is for).                              |
 
 Not planned for now: an `async` executor, fibers, `no_std`, an FFI for C++ (it comes when C++ needs to submit jobs,
 for example for a render thread), a lock-free queue (only if measurements ask for it). The queues live in one module (`queue.rs`) behind a small
