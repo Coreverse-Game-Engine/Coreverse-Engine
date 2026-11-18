@@ -30,10 +30,19 @@ impl WorkerCount {
     #[must_use]
     pub fn resolve(self) -> usize {
         match self {
-            Self::Auto => auto_workers(platform::info::cpu_info().logical_cores),
+            Self::Auto => auto_workers(logical_cores()),
             Self::Exact(count) => count,
         }
     }
+}
+
+/// The number of logical cores, 1 when the OS does not say.
+///
+/// This is the same call `platform::info::cpu_info()` makes for its `logical_cores`, without the physical-core
+/// query `cpu_info()` also runs: `Auto` has no use for that answer, and the query is an OS call that costs an
+/// allocation and a parse (on Windows `GetLogicalProcessorInformationEx`, which Miri cannot execute).
+fn logical_cores() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
 }
 
 /// [`WorkerCount::Auto`] for a machine with `logical_cores` cores.
@@ -175,6 +184,16 @@ mod tests {
         assert_eq!(auto_workers(2), 1);
         assert_eq!(auto_workers(8), 7);
         assert_eq!(auto_workers(100_000), MAX_WORKERS);
+    }
+
+    #[test]
+    fn the_logical_core_count_agrees_with_the_platform_crate() {
+        // Native only: `platform::info::cpu_info()` also asks the OS for the physical cores, which Miri
+        // cannot do on Windows. The point of this test is that `Auto` and `cpu_info()` see the same machine.
+        if !cfg!(miri) {
+            assert_eq!(logical_cores(), platform::info::cpu_info().logical_cores);
+        }
+        assert!(logical_cores() >= 1);
     }
 
     #[test]

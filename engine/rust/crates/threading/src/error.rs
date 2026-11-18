@@ -29,8 +29,10 @@ pub enum ThreadingError {
         source: std::io::Error,
     },
 
-    /// The pool has finished shutting down and accepts no more jobs. Only a [`Spawner`](crate::Spawner) can
-    /// run into this: a [`ThreadPool`](crate::ThreadPool) cannot be used after it has shut down.
+    /// The pool is shutting down (or has shut down) and does not take this job: from the moment the shutdown
+    /// begins, a [`Spawner`](crate::Spawner) only accepts jobs from threads that are running one of the pool's
+    /// jobs. Only a spawner can run into this: a [`ThreadPool`](crate::ThreadPool) cannot be used once it is
+    /// being dropped.
     #[error("the thread pool has shut down")]
     PoolClosed,
 }

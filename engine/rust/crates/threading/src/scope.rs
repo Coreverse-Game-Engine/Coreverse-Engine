@@ -277,8 +277,9 @@ impl<'scope> Scope<'scope, '_> {
         let task = unsafe { erase_lifetime(task) };
 
         if let Err(task) = self.shared.submit(priority, task) {
-            // The pool has shut down (only possible through a `Spawner` that outlived it), so there is no
-            // worker to take the job: run it here. The scope's contract holds either way.
+            // The pool is shutting down or has shut down and this thread is not running one of its jobs (only
+            // possible through a `Spawner` that outlived the pool), so the job cannot be queued: run it here.
+            // The scope's contract holds either way.
             task();
         }
     }

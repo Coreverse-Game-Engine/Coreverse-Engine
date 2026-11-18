@@ -11,6 +11,12 @@ use threading::{PoolConfig, ThreadPool, ThreadPriority, ThreadingError, WorkerCo
 /// A generous limit for "this must not hang"; tests only wait this long when something is broken.
 const PATIENCE: Duration = Duration::from_secs(20);
 
+/// How many items or repetitions a test uses: `normal` on a real run, `under_miri` under Miri, which runs
+/// hundreds of times slower than native code. The behaviour tested is the same; only the amount of work changes.
+const fn scaled(normal: usize, under_miri: usize) -> usize {
+    if cfg!(miri) { under_miri } else { normal }
+}
+
 fn pool_with(workers: usize) -> ThreadPool {
     ThreadPool::new(PoolConfig::new().with_workers(WorkerCount::Exact(workers)))
         .expect("the pool starts")
@@ -33,7 +39,8 @@ fn a_job_can_return_a_non_copy_value() {
 fn many_jobs_all_run_exactly_once() {
     let pool = pool_with(4);
     let counter = Arc::new(AtomicUsize::new(0));
-    let handles: Vec<_> = (0..1_000)
+    let jobs = scaled(1_000, 40);
+    let handles: Vec<_> = (0..jobs)
         .map(|_| {
             let counter = Arc::clone(&counter);
             pool.spawn(move || counter.fetch_add(1, Ordering::SeqCst))
@@ -43,10 +50,10 @@ fn many_jobs_all_run_exactly_once() {
     seen.sort_unstable();
     assert_eq!(
         seen,
-        (0..1_000).collect::<Vec<_>>(),
+        (0..jobs).collect::<Vec<_>>(),
         "each increment happened once"
     );
-    assert_eq!(counter.load(Ordering::SeqCst), 1_000);
+    assert_eq!(counter.load(Ordering::SeqCst), jobs);
 }
 
 #[test]
@@ -184,6 +191,10 @@ fn every_worker_gets_its_own_index() {
 }
 
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "Miri cannot call the OS thread priority API (SetThreadPriority and friends)"
+)]
 fn a_lower_thread_priority_is_accepted() {
     // Lowering a priority is allowed everywhere; the point is that the pool starts and works.
     let pool = ThreadPool::new(
@@ -196,6 +207,10 @@ fn a_lower_thread_priority_is_accepted() {
 }
 
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "Miri cannot call the OS thread priority API (SetThreadPriority and friends)"
+)]
 fn a_refused_priority_boost_does_not_stop_the_pool() {
     // Raising a priority needs a privilege on Linux; without it the worker keeps the default priority.
     let pool = ThreadPool::new(
@@ -219,14 +234,15 @@ fn an_invalid_config_is_rejected_before_anything_starts() {
 fn dropping_the_pool_finishes_the_queued_jobs() {
     let counter = Arc::new(AtomicUsize::new(0));
     let pool = pool_with(2);
-    for _ in 0..200 {
+    let jobs = scaled(200, 20);
+    for _ in 0..jobs {
         let counter = Arc::clone(&counter);
         drop(pool.spawn(move || {
             counter.fetch_add(1, Ordering::SeqCst);
         }));
     }
     drop(pool);
-    assert_eq!(counter.load(Ordering::SeqCst), 200);
+    assert_eq!(counter.load(Ordering::SeqCst), jobs);
 }
 
 #[test]
@@ -265,10 +281,11 @@ fn a_job_can_wait_for_another_job_on_a_one_worker_pool() {
 fn jobs_can_be_spawned_from_many_threads_at_once() {
     let pool = pool_with(4);
     let counter = Arc::new(AtomicUsize::new(0));
+    let per_thread = scaled(500, 25);
     thread::scope(|scope| {
         for _ in 0..4 {
             scope.spawn(|| {
-                let handles: Vec<_> = (0..500)
+                let handles: Vec<_> = (0..per_thread)
                     .map(|_| {
                         let counter = Arc::clone(&counter);
                         pool.spawn(move || counter.fetch_add(1, Ordering::SeqCst))
@@ -280,7 +297,7 @@ fn jobs_can_be_spawned_from_many_threads_at_once() {
             });
         }
     });
-    assert_eq!(counter.load(Ordering::SeqCst), 2_000);
+    assert_eq!(counter.load(Ordering::SeqCst), 4 * per_thread);
 }
 
 #[test]
@@ -299,6 +316,9 @@ fn the_last_owner_of_a_pool_can_be_one_of_its_own_jobs() {
     finished
         .recv_timeout(PATIENCE)
         .expect("the job finished instead of deadlocking");
+    // The worker that ran the job is detached (nobody can join it) and is still on its way out. Give it time to
+    // leave: Miri reports threads that are still alive when the program ends.
+    thread::sleep(Duration::from_millis(100));
 }
 
 mod single_threaded {

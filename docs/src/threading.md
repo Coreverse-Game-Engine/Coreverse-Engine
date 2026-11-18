@@ -10,7 +10,7 @@ uses `std` only and has one `unsafe` block (see "Scoped jobs" below).
 |:------------------------------------|:-----------------------------------------------------------------------------------------------------------------------------------------------------|
 | `ThreadPool`                        | A pool of named worker threads with a queue per worker and a shared queue for outside jobs. `new(config)`, `spawn(closure)`, `spawn_with_priority(priority, closure)`, `spawner()`, `run_pending()`, `shutdown()`, `worker_count()`, `pending_jobs()`. |
 | `JobPriority`                       | `Low`, `Normal` (default), `High`. Strict: a higher priority always starts first.                                                                    |
-| `Spawner`                           | A cloneable handle that spawns jobs without owning the pool; what a job carries to start more jobs. Fails with `PoolClosed` after shutdown. Also has `scope`, `join` and the `parallel_*` operations. |
+| `Spawner`                           | A cloneable handle that spawns jobs without owning the pool; what a job carries to start more jobs. Fails with `PoolClosed` once the shutdown has begun (unless called from a running job). Also has `scope`, `join` and the `parallel_*` operations. |
 | `Scope`, `ThreadPool::scope`        | Scoped jobs: `scope.spawn(...)` may borrow from the surrounding code; `scope` returns when all of them are done.                                      |
 | `join`                              | `pool.join(a, b)`: `a` on this thread, `b` as a job; both results back; both may borrow.                                                               |
 | `parallel_*`                        | `parallel_for(range, f)`, `parallel_chunks(range, chunk, f)`, `parallel_for_each(slice, f)`, `parallel_for_each_mut(slice, f)`, `parallel_chunks_mut(slice, chunk, f)`. |
@@ -63,8 +63,9 @@ pool.parallel_for(0..1_000, |i| {
 
 * **No global pool.** The code that creates a `ThreadPool` owns it and hands out `&ThreadPool` or an
   `Arc<ThreadPool>`. Nothing is initialized behind the program's back.
-* **Worker count.** `WorkerCount::Auto` is `max(1, logical cores - 1)`: the thread that creates the pool (the game
-  loop, the editor's GUI thread) keeps a core. `Exact(n)` is limited to `MAX_WORKERS` (1024). Workers are named
+* **Worker count.** `WorkerCount::Auto` is `max(1, logical cores - 1)` (the logical cores come from
+  `std::thread::available_parallelism`, the same call `platform::info::cpu_info()` makes, without its physical-core
+  query): the thread that creates the pool (the game loop, the editor's GUI thread) keeps a core. `Exact(n)` is limited to `MAX_WORKERS` (1024). Workers are named
   `<prefix>-<index>` (default prefix `cv-worker`); the OS may shorten the name (Linux keeps 15 bytes).
 * **Thread priority** is a request. A worker asks the OS for the configured priority when it starts; if the OS
   refuses (on Linux, raising a priority needs a privilege), the worker keeps the default and works as usual.
@@ -89,10 +90,17 @@ pool.parallel_for(0..1_000, |i| {
   with more than one worker nothing is promised about the order in which jobs *finish*. A test that logs from jobs
   must not let a waiting thread run jobs concurrently with the worker (see "help while waiting").
 * **Spawners.** A `Spawner` does not keep the pool alive, unlike an `Arc<ThreadPool>`, which could make a job the
-  last owner of its own pool. While the pool drains at shutdown, jobs spawned by running jobs are accepted and run;
-  once the pool has finished shutting down, `Spawner::spawn` returns `PoolClosed`. Every job a spawner got
-  accepted runs, even when spawning races with the shutdown (the shared queue closes only when it is seen empty
-  under its lock).
+  last owner of its own pool. Once the pool's shutdown has begun, `Spawner::spawn` returns `PoolClosed` for every
+  thread that is not running one of the pool's jobs; a thread that is running one (a worker, or a thread that helps
+  while it waits, or the thread that is shutting the pool down) can still spawn, because the jobs a running job
+  spawns are part of the work the shutdown has to finish. Every job a spawner got accepted runs, even when spawning
+  races with the shutdown (the shared queue closes only when it is seen empty under its lock).
+* **The shutdown is finite.** It ends after the jobs that were queued when it began, and whatever those jobs spawn,
+  have run, whatever other threads do. (An earlier version accepted jobs from any thread until it saw the queue
+  empty; a thread that kept spawning jobs a little faster than the workers ran them could keep the queue non-empty
+  for ever, so `drop(pool)` never returned and the producer, which only stops once the pool is closed, never
+  stopped. The regression test is `a_pool_shuts_down_even_while_another_thread_keeps_spawning`.) A job that never
+  ends, or that spawns jobs for ever, still keeps the shutdown from ending: that is the job's doing.
 * **Sleeping workers.** An idle worker sleeps on a condition variable. Whoever queues a job raises a per-priority
   counter first, then wakes a sleeper if one exists; a worker that is about to sleep announces itself and re-checks
   the counter under the lock, so a wake-up cannot be lost. The fast path (nobody asleep) is one atomic load.
@@ -145,8 +153,35 @@ the scope never lets the borrowed data go while a job can still touch it:
 
 The compiler rejects the misuse cases (a job borrowing something that dies with the body, a `&Scope` escaping,
 two jobs borrowing the same variable mutably, reading what a job may change, capturing a non-`Send` value, using a
-value after moving it into a job); each is a `compile_fail` doc test on `Scope`. Miri is not run on this crate yet (see
-the roadmap).
+value after moving it into a job); each is a `compile_fail` doc test on `Scope`. Miri is the tool that checks the one
+`unsafe` block at run time; see "Running Miri" below.
+
+## Running Miri
+
+Miri checks the `unsafe` block in `scope.rs` (and everything else the tests execute) for undefined behaviour. It needs
+a nightly toolchain: `rustup +nightly component add miri`. It runs the code in an interpreter, hundreds of times
+slower than native, so run the test targets one by one:
+
+```text
+cargo +nightly miri test -p threading --lib
+cargo +nightly miri test -p threading --test pool
+cargo +nightly miri test -p threading --test scheduling
+cargo +nightly miri test -p threading --test scoped
+cargo +nightly miri test -p threading --doc
+```
+
+* The tests scale their workload down under Miri (`scaled(normal, under_miri)` in each test file; the behaviour tested is
+  the same, only the amount of work changes).
+* Two tests are ignored under Miri (`#[cfg_attr(miri, ignore)]`): the ones that ask the OS for a worker thread priority,
+  because Miri cannot call `SetThreadPriority` and the like. That call is `platform`'s FFI, there is nothing for Miri to
+  check in it.
+* `WorkerCount::Auto` does not call `platform::info::cpu_info()` (which also runs `GetLogicalProcessorInformationEx` on
+  Windows, an OS call Miri cannot execute).
+* Threads interleave differently with every seed. To explore more interleavings, run a target with several seeds, for
+  example in PowerShell `$env:MIRIFLAGS = "-Zmiri-many-seeds=0..8"` before the command (it runs the whole target once
+  per seed, so it multiplies the time). Add `-Zmiri-backtrace=full` to get complete backtraces when something fails.
+* Miri finds undefined behaviour (invalid pointers, lifetimes, aliasing, data races on non-atomic data) in the paths the
+  tests execute. It does not find logic races or deadlocks, which is what the repeated native runs are for.
 
 ## Roadmap
 

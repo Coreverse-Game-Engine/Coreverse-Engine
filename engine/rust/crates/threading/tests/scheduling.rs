@@ -4,10 +4,10 @@
 //! before the jobs are done: a waiting thread helps by running jobs itself (see `JobHandle`), which would make the
 //! observed order depend on the test thread. They receive results over channels instead.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use threading::{
     JobPriority, PoolConfig, Spawner, ThreadPool, ThreadingError, WorkerCount, worker_index,
@@ -16,9 +16,36 @@ use threading::{
 /// A generous limit for "this must not hang"; tests only wait this long when something is broken.
 const PATIENCE: Duration = Duration::from_secs(20);
 
+/// How many items or repetitions a test uses: `normal` on a real run, `under_miri` under Miri, which runs
+/// hundreds of times slower than native code. The behaviour tested is the same; only the amount of work changes.
+const fn scaled(normal: usize, under_miri: usize) -> usize {
+    if cfg!(miri) { under_miri } else { normal }
+}
+
 fn pool_with(workers: usize) -> ThreadPool {
     ThreadPool::new(PoolConfig::new().with_workers(WorkerCount::Exact(workers)))
         .expect("the pool starts")
+}
+
+/// Runs `f` on a thread of its own and waits for it for at most `PATIENCE`.
+///
+/// A deadlock or a livelock then fails the test with a message that says what did not finish, instead of a test
+/// run that never ends. When the time is up the thread is left behind (the test has failed anyway).
+fn within_patience<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (send, receive) = mpsc::channel();
+    let thread = thread::spawn(move || {
+        let _ = send.send(f());
+    });
+    match receive.recv_timeout(PATIENCE) {
+        Ok(value) => {
+            thread.join().expect("the thread ended");
+            value
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            panic!("{what} did not finish within {PATIENCE:?}: a deadlock or a livelock")
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => panic!("{what} panicked"),
+    }
 }
 
 #[test]
@@ -194,7 +221,7 @@ mod queues_and_stealing {
     #[test]
     fn jobs_do_not_get_lost_while_workers_go_to_sleep() {
         let pool = pool_with(3);
-        for round in 0..400_usize {
+        for round in 0..scaled(400, 30) {
             let (send, receive) = mpsc::channel();
             drop(pool.spawn(move || send.send(round).unwrap()));
             assert_eq!(receive.recv_timeout(PATIENCE).expect("woken"), round);
@@ -209,7 +236,7 @@ mod queues_and_stealing {
     fn a_job_pushed_to_a_busy_workers_queue_wakes_a_sleeping_one() {
         let pool = pool_with(2);
         let spawner = pool.spawner();
-        for _ in 0..200 {
+        for _ in 0..scaled(200, 15) {
             let (done, finished) = mpsc::channel();
             let spawner = spawner.clone();
             drop(pool.spawn(move || {
@@ -253,15 +280,15 @@ mod spawners {
 
     #[test]
     fn a_job_tree_that_waits_for_its_children_completes_at_every_pool_size() {
-        const DEPTH: u32 = 4;
-        let expected: usize = (0..=DEPTH).map(|d| FAN.pow(d)).sum();
+        let depth: u32 = if cfg!(miri) { 2 } else { 4 };
+        let expected: usize = (0..=depth).map(|d| FAN.pow(d)).sum();
         for workers in [0, 1, 2, 4] {
             let pool = pool_with(workers);
             let counter = Arc::new(AtomicUsize::new(0));
             let root = {
                 let spawner = pool.spawner();
                 let counter = Arc::clone(&counter);
-                pool.spawn(move || fan_out(spawner.clone(), counter, DEPTH))
+                pool.spawn(move || fan_out(spawner.clone(), counter, depth))
             };
             root.wait();
             assert_eq!(
@@ -300,79 +327,201 @@ mod spawners {
                 );
             }
         }
+        let links = scaled(50, 8) as u32;
         for workers in [0, 1, 3] {
             let pool = pool_with(workers);
             let counter = Arc::new(AtomicUsize::new(0));
             let spawner = pool.spawner();
             let c = Arc::clone(&counter);
-            drop(pool.spawn(move || chain(spawner.clone(), c, 50)));
+            drop(pool.spawn(move || chain(spawner.clone(), c, links)));
             drop(pool); // returns only after the whole chain ran
-            assert_eq!(counter.load(Ordering::SeqCst), 51, "{workers} workers");
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                links as usize + 1,
+                "{workers} workers"
+            );
         }
     }
 
     #[test]
     fn every_job_a_spawner_got_accepted_runs_even_if_the_pool_closes_meanwhile() {
-        let pool = pool_with(2);
-        let ran = Arc::new(AtomicUsize::new(0));
-        let accepted = Arc::new(AtomicUsize::new(0));
-        let threads: Vec<_> = (0..4)
-            .map(|_| {
-                let spawner = pool.spawner();
-                let ran = Arc::clone(&ran);
-                let accepted = Arc::clone(&accepted);
-                thread::spawn(move || {
-                    loop {
-                        // Backpressure: the producers must not outrun the workers by more than a bounded
-                        // amount, or this test would queue millions of jobs in the 30 ms it runs.
-                        while accepted.load(Ordering::SeqCst) > ran.load(Ordering::SeqCst) + 2_000 {
-                            thread::yield_now();
-                        }
-                        let ran = Arc::clone(&ran);
-                        match spawner.spawn(move || {
-                            ran.fetch_add(1, Ordering::SeqCst);
-                        }) {
-                            Ok(handle) => {
-                                accepted.fetch_add(1, Ordering::SeqCst);
-                                drop(handle);
+        within_patience("the pool shutting down under four producers", || {
+            let pool = pool_with(2);
+            let ran = Arc::new(AtomicUsize::new(0));
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let backlog = scaled(2_000, 20);
+            let threads: Vec<_> = (0..4)
+                .map(|_| {
+                    let spawner = pool.spawner();
+                    let ran = Arc::clone(&ran);
+                    let accepted = Arc::clone(&accepted);
+                    thread::spawn(move || {
+                        loop {
+                            // Backpressure: the producers must not run ahead of the workers by more than a
+                            // bounded amount, or this test would queue millions of jobs.
+                            while accepted.load(Ordering::SeqCst)
+                                > ran.load(Ordering::SeqCst) + backlog
+                            {
+                                thread::yield_now();
                             }
-                            Err(ThreadingError::PoolClosed) => return,
+                            let ran = Arc::clone(&ran);
+                            match spawner.spawn(move || {
+                                ran.fetch_add(1, Ordering::SeqCst);
+                            }) {
+                                Ok(handle) => {
+                                    accepted.fetch_add(1, Ordering::SeqCst);
+                                    drop(handle);
+                                }
+                                Err(ThreadingError::PoolClosed) => return,
+                                Err(other) => panic!("unexpected error: {other}"),
+                            }
+                        }
+                    })
+                })
+                .collect();
+            // Close the pool once the producers have really been at work (a count, not a time, so that the
+            // test does not depend on how fast or how slowly the threads are scheduled).
+            while accepted.load(Ordering::SeqCst) < scaled(200, 8) {
+                thread::yield_now();
+            }
+            drop(pool);
+            for thread in threads {
+                thread
+                    .join()
+                    .expect("the spawning thread ended after the pool closed");
+            }
+            assert!(accepted.load(Ordering::SeqCst) > 0);
+            assert_eq!(
+                ran.load(Ordering::SeqCst),
+                accepted.load(Ordering::SeqCst),
+                "no accepted job was lost"
+            );
+        });
+    }
+
+    /// Regression test: a pool must finish shutting down even while another thread keeps spawning.
+    ///
+    /// The shutdown used to wait until it saw the queue empty. A producer that spawns jobs a little faster than
+    /// one worker runs them keeps the queue non-empty, so the workers never left, `drop(pool)` never returned,
+    /// and the producer (which only stops once the pool is closed) never stopped: a livelock. Now a spawner
+    /// refuses jobs from threads that are not running one of the pool's jobs as soon as the shutdown begins.
+    ///
+    /// The producer counts the jobs it gets accepted *after* the test has started to drop the pool. A few may
+    /// slip in before the shutdown flag is set; with the bug it goes on until it reaches a limit that is far
+    /// above that, and the test fails because the producer ended by its limit and not by a refusal.
+    #[test]
+    fn a_pool_shuts_down_even_while_another_thread_keeps_spawning() {
+        let producer_got_a_refusal = within_patience("the pool shutting down", || {
+            let pool = pool_with(1);
+            let spawner = pool.spawner();
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let dropping = Arc::new(AtomicBool::new(false));
+            let lead = scaled(2_000, 30);
+            let limit_after_drop = scaled(200_000, 10_000);
+            // Each job costs about ten times what spawning one costs, so the one worker can never catch up
+            // and the queue is never empty. Miri slows both down by about the same factor, so the job keeps
+            // its size there.
+            let spin = 3_000_u32;
+            let producer = {
+                let accepted = Arc::clone(&accepted);
+                let dropping = Arc::clone(&dropping);
+                thread::spawn(move || {
+                    let mut after_drop = 0_usize;
+                    loop {
+                        let pool_is_being_dropped = dropping.load(Ordering::SeqCst);
+                        if pool_is_being_dropped && after_drop >= limit_after_drop {
+                            return false; // the shutdown waited for this thread: the bug
+                        }
+                        // The job: busy work that the optimizer must not remove.
+                        let job = move || {
+                            for i in 0..spin {
+                                std::hint::black_box(i);
+                            }
+                        };
+                        match spawner.spawn(job) {
+                            Ok(handle) => {
+                                drop(handle);
+                                accepted.fetch_add(1, Ordering::Relaxed);
+                                if pool_is_being_dropped {
+                                    after_drop += 1;
+                                }
+                            }
+                            Err(ThreadingError::PoolClosed) => return true,
                             Err(other) => panic!("unexpected error: {other}"),
                         }
                     }
                 })
-            })
-            .collect();
-        thread::sleep(Duration::from_millis(30));
-        drop(pool);
-        for thread in threads {
-            thread
-                .join()
-                .expect("the spawning thread ended after the pool closed");
-        }
-        assert!(accepted.load(Ordering::SeqCst) > 0);
-        assert_eq!(
-            ran.load(Ordering::SeqCst),
-            accepted.load(Ordering::SeqCst),
-            "no accepted job was lost"
+            };
+            // Let a queue build up, then start to drop the pool while the producer is at full speed.
+            while accepted.load(Ordering::Relaxed) < lead {
+                thread::yield_now();
+            }
+            dropping.store(true, Ordering::SeqCst);
+            drop(pool);
+            producer.join().expect("the producer ended")
+        });
+        assert!(
+            producer_got_a_refusal,
+            "the producer went on and on after the shutdown began: it was not refused"
         );
+    }
+
+    #[test]
+    fn a_spawner_refuses_other_threads_as_soon_as_the_shutdown_begins() {
+        within_patience("the shutdown test", || {
+            let pool = pool_with(1);
+            let spawner = pool.spawner();
+            let (started_send, started) = mpsc::channel();
+            let (open, gate) = mpsc::channel::<()>();
+            drop(pool.spawn(move || {
+                started_send.send(()).unwrap();
+                gate.recv_timeout(PATIENCE).expect("the gate opens");
+            }));
+            started.recv_timeout(PATIENCE).expect("the worker is busy");
+
+            // The pool is dropped on another thread. It cannot finish while the gate is closed, because the
+            // only worker is busy with the job that waits for it.
+            let dropper = thread::spawn(move || drop(pool));
+
+            // The shutdown has begun once the spawner starts to refuse. This thread runs no job of the pool.
+            let deadline = Instant::now() + PATIENCE;
+            loop {
+                match spawner.spawn(|| ()) {
+                    Err(ThreadingError::PoolClosed) => break,
+                    Ok(handle) => drop(handle), // before the shutdown began; it will run
+                    Err(other) => panic!("unexpected error: {other}"),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the spawner kept accepting jobs after the shutdown began"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                !dropper.is_finished(),
+                "the refusal came from the shutdown that is still waiting for the busy worker"
+            );
+            open.send(()).unwrap();
+            dropper.join().expect("the pool shut down");
+        });
     }
 
     #[test]
     fn many_jobs_spawn_many_jobs_from_many_workers() {
         let pool = pool_with(4);
         let counter = Arc::new(AtomicUsize::new(0));
-        let roots: Vec<_> = (0..16)
+        let depth: u32 = if cfg!(miri) { 2 } else { 3 };
+        let roots: Vec<_> = (0..scaled(16, 3))
             .map(|_| {
                 let spawner = pool.spawner();
                 let counter = Arc::clone(&counter);
-                pool.spawn(move || fan_out(spawner.clone(), counter, 3))
+                pool.spawn(move || fan_out(spawner.clone(), counter, depth))
             })
             .collect();
         for root in roots {
             root.wait();
         }
-        let per_root: usize = (0..=3).map(|d| FAN.pow(d)).sum();
-        assert_eq!(counter.load(Ordering::SeqCst), 16 * per_root);
+        let per_root: usize = (0..=depth).map(|d| FAN.pow(d)).sum();
+        assert_eq!(counter.load(Ordering::SeqCst), scaled(16, 3) * per_root);
     }
 }

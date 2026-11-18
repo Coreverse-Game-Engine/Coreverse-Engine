@@ -13,6 +13,12 @@ use threading::{JobPriority, PoolConfig, Scope, ThreadPool, WorkerCount};
 /// Pool sizes every behaviour test runs on: no workers, one, a few, more than the machine probably has.
 const SIZES: [usize; 4] = [0, 1, 3, 8];
 
+/// How many items or repetitions a test uses: `normal` on a real run, `under_miri` under Miri, which runs
+/// hundreds of times slower than native code. The behaviour tested is the same; only the amount of work changes.
+const fn scaled(normal: usize, under_miri: usize) -> usize {
+    if cfg!(miri) { under_miri } else { normal }
+}
+
 fn pool_with(workers: usize) -> ThreadPool {
     ThreadPool::new(PoolConfig::new().with_workers(WorkerCount::Exact(workers)))
         .expect("the pool starts")
@@ -101,8 +107,13 @@ mod scope {
         for workers in SIZES {
             let pool = pool_with(workers);
             let counter = AtomicUsize::new(0);
-            pool.scope(|scope| spawn_tree(scope, &counter, 8));
-            assert_eq!(counter.load(Ordering::SeqCst), 511, "{workers} workers");
+            let depth = scaled(8, 4) as u32;
+            pool.scope(|scope| spawn_tree(scope, &counter, depth));
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                (1_usize << (depth + 1)) - 1,
+                "{workers} workers"
+            );
         }
     }
 
@@ -241,21 +252,23 @@ mod scope {
     fn many_jobs_in_one_scope() {
         let pool = pool_with(4);
         let counter = AtomicUsize::new(0);
+        let jobs = scaled(10_000, 100);
         pool.scope(|scope| {
-            for _ in 0..10_000 {
+            for _ in 0..jobs {
                 scope.spawn(|| {
                     counter.fetch_add(1, Ordering::Relaxed);
                 });
             }
         });
-        assert_eq!(counter.load(Ordering::Relaxed), 10_000);
+        assert_eq!(counter.load(Ordering::Relaxed), jobs);
     }
 
     #[test]
     fn scopes_can_be_opened_over_and_over() {
         let pool = pool_with(3);
         let counter = AtomicUsize::new(0);
-        for _ in 0..500 {
+        let rounds = scaled(500, 20);
+        for _ in 0..rounds {
             pool.scope(|scope| {
                 scope.spawn(|| {
                     counter.fetch_add(1, Ordering::Relaxed);
@@ -265,7 +278,7 @@ mod scope {
                 });
             });
         }
-        assert_eq!(counter.load(Ordering::Relaxed), 1_000);
+        assert_eq!(counter.load(Ordering::Relaxed), 2 * rounds);
     }
 
     #[test]
@@ -286,8 +299,12 @@ mod scope {
 mod join {
     use super::*;
 
+    /// Below this the recursion runs sequentially; above it every call is a `join`.
+    const FIB_CUTOFF: u64 = if cfg!(miri) { 8 } else { 12 };
+    const FIB_N: u64 = if cfg!(miri) { 16 } else { 27 };
+
     fn fib(pool: &ThreadPool, n: u64) -> u64 {
-        if n < 12 {
+        if n < FIB_CUTOFF {
             return fib_sequential(n);
         }
         let (a, b) = pool.join(|| fib(pool, n - 1), || fib(pool, n - 2));
@@ -317,7 +334,11 @@ mod join {
     fn a_recursive_join_computes_the_same_as_the_sequential_code() {
         for workers in SIZES {
             let pool = pool_with(workers);
-            assert_eq!(fib(&pool, 27), fib_sequential(27), "{workers} workers");
+            assert_eq!(
+                fib(&pool, FIB_N),
+                fib_sequential(FIB_N),
+                "{workers} workers"
+            );
         }
     }
 
@@ -375,11 +396,12 @@ mod join {
     fn many_small_joins_in_a_row() {
         let pool = pool_with(3);
         let mut total = 0_u64;
-        for n in 0..2_000_u64 {
+        let joins = scaled(2_000, 50) as u64;
+        for n in 0..joins {
             let (a, b) = pool.join(|| n, || n * 2);
             total += a + b;
         }
-        assert_eq!(total, (0..2_000_u64).map(|n| n * 3).sum());
+        assert_eq!(total, (0..joins).map(|n| n * 3).sum());
     }
 }
 
@@ -399,7 +421,8 @@ mod parallel_loops {
     fn parallel_for_visits_every_index_exactly_once() {
         for workers in SIZES {
             let pool = pool_with(workers);
-            let seen = visits(&pool, 10_000, 0..10_000);
+            let len = scaled(10_000, 300);
+            let seen = visits(&pool, len, 0..len);
             assert!(seen.iter().all(|&n| n == 1), "{workers} workers");
         }
     }
@@ -437,7 +460,7 @@ mod parallel_loops {
                 (12, 4),
                 (1, 3),
                 (0, 3),
-                (1_000, 7),
+                (scaled(1_000, 100), 7),
             ] {
                 let seen = Mutex::new(Vec::new());
                 pool.parallel_chunks(0..len, chunk_size, |chunk| seen.lock().unwrap().push(chunk));
@@ -481,12 +504,17 @@ mod parallel_loops {
     fn parallel_for_each_visits_every_item() {
         for workers in SIZES {
             let pool = pool_with(workers);
-            let values: Vec<u64> = (1..=1_000).collect();
+            let count = scaled(1_000, 100) as u64;
+            let values: Vec<u64> = (1..=count).collect();
             let total = AtomicUsize::new(0);
             pool.parallel_for_each(&values, |value| {
                 total.fetch_add(*value as usize, Ordering::Relaxed);
             });
-            assert_eq!(total.load(Ordering::Relaxed), 500_500, "{workers} workers");
+            assert_eq!(
+                total.load(Ordering::Relaxed) as u64,
+                count * (count + 1) / 2,
+                "{workers} workers"
+            );
             pool.parallel_for_each(&Vec::<u64>::new(), |_| panic!("no items"));
         }
     }
@@ -495,7 +523,7 @@ mod parallel_loops {
     fn parallel_for_each_mut_changes_every_item_once() {
         for workers in SIZES {
             let pool = pool_with(workers);
-            let mut values = vec![0_u32; 5_000];
+            let mut values = vec![0_u32; scaled(5_000, 200)];
             pool.parallel_for_each_mut(&mut values, |value| *value += 1);
             assert!(values.iter().all(|&v| v == 1), "{workers} workers");
             pool.parallel_for_each_mut(&mut Vec::<u32>::new(), |_| panic!("no items"));
@@ -536,16 +564,22 @@ mod parallel_loops {
         for workers in SIZES {
             let pool = pool_with(workers);
             let visited = AtomicUsize::new(0);
+            let len = scaled(2_000, 200);
+            let bad = scaled(1_234, 123);
             let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-                pool.parallel_for(0..2_000, |i| {
+                pool.parallel_for(0..len, |i| {
                     visited.fetch_add(1, Ordering::SeqCst);
-                    if i == 1_234 {
-                        panic!("index 1234");
+                    if i == bad {
+                        panic!("index {bad}");
                     }
                 });
             }));
             let payload = outcome.expect_err("the loop re-raises");
-            assert_eq!(message(&*payload), Some("index 1234"), "{workers} workers");
+            assert_eq!(
+                message(&*payload),
+                Some(format!("index {bad}").as_str()),
+                "{workers} workers"
+            );
             assert!(visited.load(Ordering::SeqCst) > 1, "other chunks still ran");
             assert_eq!(pool.spawn(|| 5).wait(), 5);
         }
@@ -553,13 +587,14 @@ mod parallel_loops {
 
     #[test]
     fn a_loop_can_run_inside_a_job_through_a_spawner() {
+        let len = scaled(1_000, 100);
         for workers in [1, 2] {
             let pool = pool_with(workers);
             let spawner = pool.spawner();
             let (report, reported) = mpsc::channel();
             drop(pool.spawn(move || {
                 let total = AtomicUsize::new(0);
-                spawner.parallel_for(0..1_000, |i| {
+                spawner.parallel_for(0..len, |i| {
                     total.fetch_add(i, Ordering::Relaxed);
                 });
                 report.send(total.into_inner()).unwrap();
@@ -567,7 +602,7 @@ mod parallel_loops {
             let total = reported
                 .recv_timeout(Duration::from_secs(20))
                 .expect("no deadlock");
-            assert_eq!(total, 499_500, "{workers} workers");
+            assert_eq!(total, len * (len - 1) / 2, "{workers} workers");
         }
     }
 
@@ -576,12 +611,17 @@ mod parallel_loops {
         for workers in [0, 1, 2, 4] {
             let pool = pool_with(workers);
             let total = AtomicUsize::new(0);
-            pool.parallel_for(0..20, |_| {
-                pool.parallel_for(0..30, |_| {
+            let (outer, inner) = (scaled(20, 4), scaled(30, 5));
+            pool.parallel_for(0..outer, |_| {
+                pool.parallel_for(0..inner, |_| {
                     total.fetch_add(1, Ordering::Relaxed);
                 });
             });
-            assert_eq!(total.load(Ordering::Relaxed), 600, "{workers} workers");
+            assert_eq!(
+                total.load(Ordering::Relaxed),
+                outer * inner,
+                "{workers} workers"
+            );
         }
     }
 
@@ -620,11 +660,12 @@ mod parallel_loops {
                     .take_while(|d| d * d <= n)
                     .all(|d| !n.is_multiple_of(d))
         }
-        let expected = (0..20_000_u32).filter(|&n| is_prime(n)).count();
+        let limit = scaled(20_000, 1_500) as u32;
+        let expected = (0..limit).filter(|&n| is_prime(n)).count();
         for workers in SIZES {
             let pool = pool_with(workers);
             let found = AtomicUsize::new(0);
-            pool.parallel_chunks(0..20_000, 500, |chunk| {
+            pool.parallel_chunks(0..limit as usize, scaled(500, 100), |chunk| {
                 let count = chunk.filter(|&n| is_prime(n as u32)).count();
                 found.fetch_add(count, Ordering::Relaxed);
             });
@@ -636,11 +677,12 @@ mod parallel_loops {
     fn loops_can_be_run_over_and_over() {
         let pool = pool_with(3);
         let total = AtomicUsize::new(0);
-        for _ in 0..200 {
-            pool.parallel_for(0..50, |_| {
+        let (rounds, per_round) = (scaled(200, 10), scaled(50, 20));
+        for _ in 0..rounds {
+            pool.parallel_for(0..per_round, |_| {
                 total.fetch_add(1, Ordering::Relaxed);
             });
         }
-        assert_eq!(total.load(Ordering::Relaxed), 10_000);
+        assert_eq!(total.load(Ordering::Relaxed), rounds * per_round);
     }
 }

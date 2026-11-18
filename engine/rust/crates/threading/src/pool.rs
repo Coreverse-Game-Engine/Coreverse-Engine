@@ -67,16 +67,31 @@ impl Shared {
         Ok(JobHandle::new(slot, Arc::clone(self)))
     }
 
-    /// Queues a task and wakes a sleeping worker. A task from one of this pool's own workers goes into that
-    /// worker's queue; every other task goes into the shared queue, which refuses it (and gives it back) once the
-    /// pool has shut down.
+    /// Queues a task and wakes a sleeping worker.
+    ///
+    /// * A task from one of this pool's own workers goes into that worker's queue. This is never refused: the
+    ///   worker is still running and will find it.
+    /// * Any other task goes into the shared queue, which gives the task back (`Err`) in two cases: the pool has
+    ///   finished shutting down, or the shutdown has begun and the calling thread is not running one of this
+    ///   pool's jobs.
+    ///
+    /// The second case is what keeps a shutdown finite. The shutdown has to run everything that is queued, and
+    /// the jobs that running jobs spawn (those are accepted, hence the exception); but if any thread holding a
+    /// spawner could add work for as long as it likes, the queue might never be seen empty, the workers would
+    /// never leave and the pool would never finish shutting down.
     pub(crate) fn submit(&self, priority: JobPriority, task: Task) -> Result<(), Task> {
         let result = match worker::index_in(self.id) {
             Some(index) => {
                 self.queues.push_local(index, priority, task);
                 Ok(())
             }
-            None => self.queues.push_external(priority, task),
+            None => {
+                if self.shutting_down.load(Ordering::SeqCst) && !worker::is_running_job_of(self.id)
+                {
+                    return Err(task);
+                }
+                self.queues.push_external(priority, task)
+            }
         };
         if result.is_ok() {
             self.sleep.wake_one();
@@ -94,11 +109,18 @@ impl Shared {
         self.queues.queued() > 0
     }
 
+    /// Runs one task on the calling thread, which counts as running one of this pool's jobs meanwhile (see
+    /// [`submit`](Self::submit)).
+    fn run_task(&self, task: Task) {
+        let _running = worker::enter_job(self.id);
+        task();
+    }
+
     /// Runs one queued job on the calling thread. `false` when nothing was queued.
     pub(crate) fn run_one(&self) -> bool {
         match self.queues.pop(worker::index_in(self.id)) {
             Some(task) => {
-                task();
+                self.run_task(task);
                 true
             }
             None => false,
@@ -127,7 +149,9 @@ impl Shared {
 /// `Arc<ThreadPool>`) to whoever needs to spawn, and drops it to stop the workers. A job that wants to spawn
 /// more jobs should carry a [`Spawner`] ([`spawner`](Self::spawner)), which can spawn but does not keep the
 /// pool alive. Dropping the pool (or [`shutdown`](Self::shutdown)) first finishes every job that is still
-/// queued, including the jobs those jobs spawn, then joins the workers.
+/// queued, including the jobs those jobs spawn, then joins the workers. From the moment the shutdown begins, a
+/// spawner refuses jobs from any thread that is not running one of the pool's jobs, so the shutdown ends after
+/// a bounded amount of work, whatever other threads do.
 ///
 /// ```
 /// use threading::{PoolConfig, ThreadPool, WorkerCount};
@@ -281,8 +305,10 @@ impl fmt::Debug for ThreadPool {
 /// A job spawned by a job running on a worker of the pool goes into that worker's own queue (cheap, and other
 /// workers steal it when they are idle); a job spawned from any other thread goes into the shared queue.
 ///
-/// Spawning fails with [`ThreadingError::PoolClosed`] once the pool has finished shutting down. While it is
-/// still shutting down (it drains the queued jobs first) jobs that the running jobs spawn are accepted and run.
+/// Spawning fails with [`ThreadingError::PoolClosed`] once the pool has begun to shut down, unless the calling
+/// thread is running one of the pool's jobs: the jobs that running jobs spawn are part of the work the shutdown
+/// finishes, so they are accepted and run, while a thread that merely holds a spawner cannot keep the pool from
+/// ever finishing. A job that was accepted always runs.
 ///
 /// ```
 /// use threading::{PoolConfig, ThreadPool, WorkerCount};
@@ -354,7 +380,7 @@ fn worker_main(shared: &Shared, index: usize, priority: ThreadPriority) {
     // Jobs catch their own panics (see `Shared::spawn_job`), so this loop never unwinds.
     loop {
         if let Some(task) = shared.queues.pop(Some(index)) {
-            task();
+            shared.run_task(task);
             continue;
         }
         if shared.queues.queued() > 0 {
