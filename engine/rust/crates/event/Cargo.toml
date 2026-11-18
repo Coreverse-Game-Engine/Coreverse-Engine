@@ -1,6 +1,6 @@
 [package]
 name = "event"
-description = "Placeholder for the engine's event and messaging infrastructure; not yet implemented"
+description = "Coreverse's event infrastructure: a typed publish/subscribe bus with priorities and RAII subscriptions (foundation milestone E1)"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true

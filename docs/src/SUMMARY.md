@@ -11,5 +11,6 @@
 - [Math](math.md)
 - [Memory](memory.md)
 - [Threading](threading.md)
+- [Events](event.md)
 - [Editor](editor.md)
 - [Continuous integration](ci.md)
