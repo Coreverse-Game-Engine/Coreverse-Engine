@@ -6,11 +6,9 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
+use crate::flow::{Dispatch, Flow};
 use crate::priority::EventPriority;
 use crate::subscription::Subscription;
-
-/// A handler as the bus stores it.
-type Handler<E> = Arc<dyn Fn(&E) + Send + Sync>;
 
 /// The handler list of one event type, shared with the `publish` calls that are running. It is replaced, never
 /// changed in place, while a `publish` holds it (copy on write through [`Arc::make_mut`]).
@@ -37,11 +35,31 @@ fn slots_mut<E: 'static>(channel: &mut Channel) -> &mut Slots<E> {
     channel.downcast_mut::<Slots<E>>().expect(CHANNEL_MISMATCH)
 }
 
+/// A handler as the bus stores it.
+enum Handler<E> {
+    /// Sees the event by shared reference; runs for `publish` and `publish_mut`.
+    Observer(Arc<dyn Fn(&E) + Send + Sync>),
+    /// May change the event and stop the chain; runs for `publish_mut` only.
+    Interceptor(Arc<dyn Fn(&mut E) -> Flow + Send + Sync>),
+}
+
+impl<E> Clone for Handler<E> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Observer(handler) => Self::Observer(Arc::clone(handler)),
+            Self::Interceptor(handler) => Self::Interceptor(Arc::clone(handler)),
+        }
+    }
+}
+
 struct Slot<E> {
     id: u64,
     priority: EventPriority,
-    /// Cleared when the handler is unsubscribed, so a `publish` that already took its list skips the handler.
+    /// Cleared when the handler is unsubscribed (or, for a one-shot handler, when it is claimed), so a publish
+    /// that already took its list skips the handler.
     active: Arc<AtomicBool>,
+    /// A one-shot handler: the first publish that claims it runs it, and no other publish ever does.
+    once: bool,
     handler: Handler<E>,
 }
 
@@ -51,7 +69,8 @@ impl<E> Clone for Slot<E> {
             id: self.id,
             priority: self.priority,
             active: Arc::clone(&self.active),
-            handler: Arc::clone(&self.handler),
+            once: self.once,
+            handler: self.handler.clone(),
         }
     }
 }
@@ -73,6 +92,7 @@ impl Inner {
     fn add<E: 'static>(
         &self,
         priority: EventPriority,
+        once: bool,
         handler: Handler<E>,
     ) -> (u64, Arc<AtomicBool>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -81,6 +101,7 @@ impl Inner {
             id,
             priority,
             active: Arc::clone(&active),
+            once,
             handler,
         };
 
@@ -122,6 +143,22 @@ impl Inner {
         true
     }
 
+    /// Decides whether a publish may run `slot` now.
+    ///
+    /// An ordinary handler may run while it is active. A one-shot handler may run only for the one publish that
+    /// flips its flag: the swap is the whole race, so concurrent publishes cannot both run it. The winner takes
+    /// the handler out of the list at once, so a publish started by the handler itself does not see it.
+    fn claim<E: 'static>(&self, slot: &Slot<E>) -> bool {
+        if !slot.once {
+            return slot.active.load(Ordering::Acquire);
+        }
+        let won = slot.active.swap(false, Ordering::AcqRel);
+        if won {
+            self.remove::<E>(slot.id);
+        }
+        won
+    }
+
     fn snapshot<E: 'static>(&self) -> Option<Slots<E>> {
         let channels = lock(&self.channels);
         channels
@@ -160,8 +197,16 @@ impl Inner {
 /// * A `publish` works on the handlers that were subscribed when it began. A handler subscribed during a publish
 ///   is first called by the next one. A handler unsubscribed during a publish is not called by it, unless it has
 ///   already started.
-/// * A handler that panics unwinds through `publish` to its caller; the handlers after it are not called for
-///   that event. The bus stays usable.
+/// * A handler that panics unwinds through `publish` (or `publish_mut`) to its caller; the handlers after it are
+///   not called for that event. The bus stays usable.
+/// * There are two kinds of handler. An *observer* ([`subscribe`](EventBus::subscribe)) sees the event by shared
+///   reference. An *interceptor* ([`subscribe_mut`](EventBus::subscribe_mut)) gets `&mut E`, may change the event,
+///   and answers with a [`Flow`]: `Stop` ends the chain.
+/// * [`publish`](EventBus::publish) takes `&E`, so it runs observers only. [`publish_mut`](EventBus::publish_mut)
+///   takes `&mut E` and runs every handler of the type in one chain, in priority order: observers see the event
+///   as the interceptors before them left it. Publish an event type the way its handlers expect.
+/// * A one-shot handler ([`subscribe_once`](EventBus::subscribe_once)) runs for the first publish that reaches it
+///   and is then unsubscribed, even if several threads publish at the same time.
 /// * A handler that holds a strong `EventBus` handle that is stored in the same bus keeps the bus alive for ever.
 ///   Capture a [`WeakEventBus`] ([`EventBus::downgrade`]) instead.
 ///
@@ -251,11 +296,138 @@ impl EventBus {
         E: 'static,
         F: Fn(&E) + Send + Sync + 'static,
     {
-        let (id, active) = self.inner.add::<E>(priority, Arc::new(handler));
+        self.register::<E>(priority, false, Handler::Observer(Arc::new(handler)))
+    }
+
+    /// Subscribes an interceptor to events of type `E` with [`EventPriority::Normal`].
+    ///
+    /// An interceptor gets the event by `&mut`, may change it, and returns [`Flow::Continue`] to hand it to the
+    /// next handler or [`Flow::Stop`] to end the chain. Interceptors run only for
+    /// [`publish_mut`](EventBus::publish_mut); [`publish`](EventBus::publish) cannot lend out `&mut E` and skips
+    /// them.
+    ///
+    /// ```
+    /// use event::{EventBus, Flow};
+    ///
+    /// struct Damage(u32);
+    ///
+    /// let bus = EventBus::new();
+    /// let _armor = bus.subscribe_mut(|damage: &mut Damage| {
+    ///     damage.0 /= 2;
+    ///     Flow::Continue
+    /// });
+    ///
+    /// let mut hit = Damage(10);
+    /// let dispatch = bus.publish_mut(&mut hit);
+    /// assert_eq!(hit.0, 5);
+    /// assert_eq!(dispatch.called(), 1);
+    /// ```
+    pub fn subscribe_mut<E, F>(&self, handler: F) -> Subscription
+    where
+        E: 'static,
+        F: Fn(&mut E) -> Flow + Send + Sync + 'static,
+    {
+        self.subscribe_mut_with_priority(EventPriority::Normal, handler)
+    }
+
+    /// Subscribes an interceptor to events of type `E` with the given priority.
+    ///
+    /// ```
+    /// use event::{EventBus, EventPriority, Flow};
+    ///
+    /// struct Door {
+    ///     open: bool,
+    /// }
+    ///
+    /// let bus = EventBus::new();
+    /// let _lock = bus.subscribe_mut_with_priority(EventPriority::High, |door: &mut Door| {
+    ///     door.open = false;
+    ///     Flow::Stop
+    /// });
+    /// let _opener = bus.subscribe_mut(|door: &mut Door| {
+    ///     door.open = true;
+    ///     Flow::Continue
+    /// });
+    ///
+    /// let mut door = Door { open: false };
+    /// let dispatch = bus.publish_mut(&mut door);
+    /// assert!(dispatch.was_stopped());
+    /// assert_eq!(dispatch.called(), 1);
+    /// assert!(!door.open);
+    /// ```
+    pub fn subscribe_mut_with_priority<E, F>(
+        &self,
+        priority: EventPriority,
+        handler: F,
+    ) -> Subscription
+    where
+        E: 'static,
+        F: Fn(&mut E) -> Flow + Send + Sync + 'static,
+    {
+        self.register::<E>(priority, false, Handler::Interceptor(Arc::new(handler)))
+    }
+
+    /// Subscribes a one-shot observer to events of type `E` with [`EventPriority::Normal`].
+    ///
+    /// The handler runs for the first event that reaches it and is unsubscribed at that moment. It is an
+    /// `FnOnce`, so it may consume what it captured. Dropping the [`Subscription`] before an event arrives
+    /// cancels the handler.
+    ///
+    /// ```
+    /// use event::EventBus;
+    ///
+    /// struct Loaded;
+    ///
+    /// let bus = EventBus::new();
+    /// let _once = bus.subscribe_once(|_: &Loaded| println!("first load"));
+    /// assert_eq!(bus.publish(&Loaded), 1);
+    /// assert_eq!(bus.publish(&Loaded), 0);
+    /// assert_eq!(bus.subscriber_count::<Loaded>(), 0);
+    /// ```
+    pub fn subscribe_once<E, F>(&self, handler: F) -> Subscription
+    where
+        E: 'static,
+        F: FnOnce(&E) + Send + 'static,
+    {
+        self.subscribe_once_with_priority(EventPriority::Normal, handler)
+    }
+
+    /// Subscribes a one-shot observer to events of type `E` with the given priority.
+    pub fn subscribe_once_with_priority<E, F>(
+        &self,
+        priority: EventPriority,
+        handler: F,
+    ) -> Subscription
+    where
+        E: 'static,
+        F: FnOnce(&E) + Send + 'static,
+    {
+        // The bus lets exactly one publish claim a one-shot handler, so the cell is only a way to move the
+        // `FnOnce` out of an `Fn` closure; it is never found empty by the publish that claimed the handler.
+        let cell = Mutex::new(Some(handler));
+        let observer = move |event: &E| {
+            let taken = lock(&cell).take();
+            if let Some(handler) = taken {
+                handler(event);
+            }
+        };
+        self.register::<E>(priority, true, Handler::Observer(Arc::new(observer)))
+    }
+
+    fn register<E: 'static>(
+        &self,
+        priority: EventPriority,
+        once: bool,
+        handler: Handler<E>,
+    ) -> Subscription {
+        let (id, active) = self.inner.add::<E>(priority, once, handler);
         Subscription::new(Arc::downgrade(&self.inner), id, active, Inner::remove::<E>)
     }
 
-    /// Calls every handler subscribed to `E`, on this thread, and returns how many it called.
+    /// Calls every observer subscribed to `E`, on this thread, and returns how many it called.
+    ///
+    /// Interceptors ([`subscribe_mut`](EventBus::subscribe_mut)) are skipped: this method only has `&E`. Use
+    /// [`publish_mut`](EventBus::publish_mut) for events that handlers may change or stop.
     ///
     /// See the [type documentation](EventBus) for the order and for what happens when handlers subscribe,
     /// unsubscribe, publish or panic.
@@ -265,12 +437,68 @@ impl EventBus {
         };
         let mut called = 0;
         for slot in slots.iter() {
-            if slot.active.load(Ordering::Acquire) {
-                (slot.handler)(event);
-                called += 1;
+            let Handler::Observer(handler) = &slot.handler else {
+                continue;
+            };
+            if !self.inner.claim(slot) {
+                continue;
             }
+            (**handler)(event);
+            called += 1;
         }
         called
+    }
+
+    /// Runs every handler subscribed to `E` as one chain, on this thread, and says what happened.
+    ///
+    /// Handlers run in priority order. An observer sees the event as it is at that point; an interceptor may
+    /// change it and may end the chain with [`Flow::Stop`]. The publisher gets the event back, with every
+    /// change, when this method returns.
+    ///
+    /// ```
+    /// use event::{EventBus, EventPriority, Flow};
+    ///
+    /// struct Score(u32);
+    ///
+    /// let bus = EventBus::new();
+    /// let _bonus = bus.subscribe_mut_with_priority(EventPriority::High, |score: &mut Score| {
+    ///     score.0 += 100;
+    ///     Flow::Continue
+    /// });
+    /// let _double = bus.subscribe_mut(|score: &mut Score| {
+    ///     score.0 *= 2;
+    ///     Flow::Continue
+    /// });
+    ///
+    /// let mut score = Score(1);
+    /// bus.publish_mut(&mut score);
+    /// assert_eq!(score.0, 202);
+    /// ```
+    pub fn publish_mut<E: 'static>(&self, event: &mut E) -> Dispatch {
+        let Some(slots) = self.inner.snapshot::<E>() else {
+            return Dispatch::default();
+        };
+        let mut called = 0;
+        let mut stopped = false;
+        for slot in slots.iter() {
+            if !self.inner.claim(slot) {
+                continue;
+            }
+            called += 1;
+            match &slot.handler {
+                Handler::Observer(handler) => {
+                    let shared: &E = event;
+                    (**handler)(shared);
+                }
+                Handler::Interceptor(handler) => {
+                    if (**handler)(&mut *event) == Flow::Stop {
+                        stopped = true;
+                        break;
+                    }
+                }
+            }
+        }
+        Dispatch::new(called, stopped)
     }
 
     /// How many handlers are subscribed to events of type `E` right now.

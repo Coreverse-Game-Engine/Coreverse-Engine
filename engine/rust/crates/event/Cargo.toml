@@ -1,6 +1,6 @@
 [package]
 name = "event"
-description = "Coreverse's event infrastructure: a typed publish/subscribe bus with priorities and RAII subscriptions (foundation milestone E1)"
+description = "Coreverse's event infrastructure: a typed publish/subscribe bus with priorities, RAII subscriptions, interceptors, cancellable events and one-shot handlers"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
