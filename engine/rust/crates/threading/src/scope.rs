@@ -31,6 +31,12 @@
 //!    data that outlives the whole call (`'env`).
 //! 6. **Panics.** A panicking job is caught inside its task (the worker thread never unwinds), its payload is
 //!    stored in the scope, and the scope re-raises the first one after every job is done.
+//! 7. **No protected borrow outlives the release.** Lowering `pending` wakes the scope's owner, which may then
+//!    read data the job wrote through a `&mut`. Under Stacked Borrows (Miri) a reference that is part of a
+//!    function argument stays protected until that function returns, and that includes references hidden in the
+//!    fields of a by-value closure environment. The task closure therefore captures the [`ScopedTask`] behind a
+//!    `Box` (whose pointee is not retagged as part of the argument) and moves the job out onto its own stack
+//!    frame; the job's call returns, and its borrows end, strictly before the guard is dropped.
 
 use std::any::Any;
 use std::fmt;
@@ -259,12 +265,14 @@ impl<'scope> Scope<'scope, '_> {
     where
         F: FnOnce() + Send + 'scope,
     {
-        let scoped = ScopedTask {
+        // The task is boxed so that the closure below captures only a `Box`, not the job itself (invariant 7):
+        // the job moves onto the stack inside the closure and is consumed by its call before the guard drops.
+        let scoped = Box::new(ScopedTask {
             job,
             guard: ScopeGuard::new(&self.state),
-        };
+        });
         let task: Box<dyn FnOnce() + Send + 'scope> = Box::new(move || {
-            let ScopedTask { job, guard } = scoped;
+            let ScopedTask { job, guard } = *scoped;
             if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(job)) {
                 guard.state.record_panic(payload);
             }
@@ -441,6 +449,21 @@ mod tests {
         drop(scoped);
         assert_eq!(seen_pending.load(Ordering::SeqCst), 1);
         assert!(state.is_idle());
+    }
+
+    #[test]
+    fn the_caller_may_read_what_a_job_wrote_through_a_mutable_borrow_as_soon_as_the_scope_ends() {
+        // Regression test for a Miri (Stacked Borrows) error: the scope used to be released while the task's
+        // closure, which owned the job's `&mut`, had not returned yet. Run it many times on a pool with workers
+        // so that the job usually runs on another thread.
+        let pool = pool(2);
+        for round in 0..50_usize {
+            let mut slot = 0;
+            pool.scope(|scope| {
+                scope.spawn(|| slot = round + 1);
+            });
+            assert_eq!(slot, round + 1);
+        }
     }
 
     #[test]
