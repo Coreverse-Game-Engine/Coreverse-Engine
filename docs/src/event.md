@@ -2,7 +2,8 @@
 
 `engine/rust/crates/event` is the engine's event infrastructure. It is being built in milestones; this page describes
 what exists (E1, the synchronous bus; E2, interceptors, cancellable events and one-shot handlers; E3, queued
-events and a cross-thread sender) and what is planned. The crate uses `std` only, has no dependencies and no `unsafe` code.
+events and a cross-thread sender; E4, delivery as jobs on the `threading` pool) and what is planned. The crate
+uses `std` and the `threading` crate (for E4 only) and has no `unsafe` code.
 
 ## What is there
 
@@ -29,6 +30,8 @@ events and a cross-thread sender) and what is planned. The crate uses `std` only
 | `post(E)` where `E: Send`                                 |              |                                  | Queues the event; nothing runs now.                         |
 | `dispatch() -> usize`                                     |              |                                  | Delivers the queued events in posting order; returns how many. |
 | `pending()`, `clear_pending()`, `sender()`                |              |                                  | Queue length, discard the queue, get an `EventSender`.      |
+| `publish_parallel(&Spawner, &E) -> usize` where `E: Sync` |              |                                  | Runs the observers as jobs; a priority is a phase.          |
+| `dispatch_parallel(&Spawner) -> usize`                    |              |                                  | Delivers the queued events of different types at the same time. |
 
 ```rust,ignore
 use event::{Cancellable, EventBus, EventPriority, Flow};
@@ -76,6 +79,12 @@ std::thread::spawn(move || {
 });
 // ... later, on the thread that owns the bus, once per frame:
 let delivered = bus.dispatch();
+
+// With a `threading::ThreadPool`: deliver the frame's events of different types in parallel,
+// or run the observers of one event as jobs.
+let pool = threading::ThreadPool::new(threading::PoolConfig::new())?;
+let delivered = bus.dispatch_parallel(&pool.spawner());
+let called = bus.publish_parallel(&pool.spawner(), &WindowResized { width: 800, height: 600 });
 ```
 
 ## Rules
@@ -136,6 +145,34 @@ let delivered = bus.dispatch();
 * **The queue is unbounded.** A producer faster than `dispatch` makes it grow. `pending()` shows the length; bounded
   queues and diagnostics are part of E5.
 
+## Parallel delivery (E4)
+
+Both methods take a `threading::Spawner` (`pool.spawner()`), which works from any thread, including inside a job: a
+thread that waits for the jobs runs queued jobs meanwhile, so a small pool is not starved. With a pool without
+workers (`WorkerCount::Exact(0)`) everything runs on the calling thread. They use only the pool's scoped jobs and
+parallel loops (T3).
+
+* **`publish_parallel(&spawner, &event)`.** A priority is a *phase*: the observers of one priority are queued as one
+  job each and may overlap, in no particular order; the next priority starts when every observer of the previous one
+  has finished. Interceptors are skipped (they need `&mut E` in a fixed order), as in `publish`, and the event must
+  be `Sync` because several observers read it at once. Within one priority the subscription order of `publish` is
+  not promised. A one-shot handler still runs exactly once. A panicking observer does not stop the others of its
+  phase; the first panic is re-raised when the phase is done and the later phases do not run.
+* **`dispatch_parallel(&spawner)`.** The pass is the same as in `dispatch` (the events queued at that moment, one
+  pass at a time, a call while a pass runs returns 0), but the events are grouped by type: the events of one type
+  are delivered one after the other in posting order by one job, and the groups run in parallel. Events of different
+  types are not ordered against each other. Each event is delivered like `publish_mut`.
+* **Panics in `dispatch_parallel`.** A panicking handler loses only its own event: the pass delivers all the others,
+  waits for every job, and then re-raises the first panic. (`dispatch`, which can stop at once, puts the undelivered
+  events back instead.)
+* **When it pays.** A handler run as a job costs a queue round trip. Use `publish_parallel` for a few expensive
+  observers and `dispatch_parallel` for frames with several independent event types; for many cheap handlers the plain
+  methods are faster.
+* **Not done.** No dependencies between handlers or between event types (a type that must be delivered after another
+  is dispatched in a later pass), no non-blocking variants that return a handle, no parallel delivery inside one event
+  type. The `threading` crate's task graphs (T4) are not used: the ordering rules here are fixed (priorities, type
+  groups), so there is nothing to schedule by hand.
+
 ## Why these choices
 
 * **`'static` types instead of an `Event` trait.** No derive or impl is needed to make something an event, and the
@@ -165,6 +202,6 @@ let delivered = bus.dispatch();
 |:----------|:-------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | E1        | Synchronous typed bus, priorities, subscription handles, thread-safe, re-entrancy-safe. Done.                                                                            |
 | E2        | Interceptors (`subscribe_mut`, `publish_mut`, `Flow`, `Dispatch`), `Cancellable`, one-shot handlers (`subscribe_once`). Done (this page).                                |
-| E3        | Queued events: `post`, `dispatch`, `pending`, `clear_pending`, and the cross-thread `EventSender`/`PostError`. Done (this page).                                        |
-| E4        | `threading` integration: dispatch a queue's handlers as jobs. Starts after the `threading` crate's task graphs (T4).                                                     |
+| E3        | Queued events: `post`, `dispatch`, `pending`, `clear_pending`, and the cross-thread `EventSender`/`PostError`. Done.                                                    |
+| E4        | `threading` integration: `publish_parallel` (priority phases) and `dispatch_parallel` (type groups) on a `Spawner`. Done (this page).                                    |
 | E5        | Diagnostics (handler counts, slow-handler reporting through the logger), benchmarks, FFI exposure if the C++ side needs it.                                              |

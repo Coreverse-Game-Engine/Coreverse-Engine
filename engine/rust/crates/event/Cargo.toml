@@ -1,12 +1,13 @@
 [package]
 name = "event"
-description = "Coreverse's event infrastructure: a typed publish/subscribe bus with priorities, RAII subscriptions, interceptors, cancellable events, one-shot handlers and a thread-safe event queue"
+description = "Coreverse's event infrastructure: a typed publish/subscribe bus with priorities, RAII subscriptions, interceptors, cancellable events, one-shot handlers, a thread-safe event queue and parallel delivery on the job system"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+threading = { path = "../threading" }
 
 [lints]
 workspace = true

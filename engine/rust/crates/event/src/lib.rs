@@ -1,9 +1,9 @@
 //! `event` — the event infrastructure of the Coreverse Engine: a typed publish/subscribe bus that calls handlers
 //! synchronously, in a defined order, with subscriptions that clean up after themselves.
 //!
-//! The crate is built in milestones. This is **E3**: the synchronous bus (E1), interceptors, cancellable events
-//! and one-shot handlers (E2), and queued events with a cross-thread sender (E3). Running handlers as jobs
-//! follows (see `docs/src/event.md`).
+//! The crate is built in milestones. This is **E4**: the synchronous bus (E1), interceptors, cancellable events
+//! and one-shot handlers (E2), queued events with a cross-thread sender (E3), and delivery as jobs on the
+//! `threading` pool (E4). Diagnostics and benchmarks follow (see `docs/src/event.md`).
 //!
 //! # What is here today
 //!
@@ -21,6 +21,11 @@
 //!   stored, in posting order, at a moment the owner chooses (say, once per frame).
 //!   [`EventSender`] ([`EventBus::sender`]) is the cloneable handle that other threads post with; it does not keep
 //!   the bus alive and returns a [`PostError`] once the bus is gone.
+//! * Parallel delivery on the job system: [`publish_parallel`](EventBus::publish_parallel) runs the observers of
+//!   one event as jobs (a priority is a phase: observers of one priority may overlap, the next priority starts
+//!   when they are done), and [`dispatch_parallel`](EventBus::dispatch_parallel) delivers the queued events of
+//!   different types at the same time while keeping each type's posting order. Both take a
+//!   [`threading::Spawner`], which works from any thread, including inside a job.
 //! * [`Subscription`]: what `subscribe` returns. **Dropping it unsubscribes the handler**;
 //!   [`detach`](Subscription::detach) keeps the handler for the life of the bus.
 //! * [`EventPriority`]: `High`, `Normal` (default) and `Low`. Same priority: subscription order.
@@ -45,7 +50,7 @@
 //!
 //! # Conventions
 //!
-//! * `std` only and no dependencies; no `unsafe` code.
+//! * `std` and the `threading` crate; no `unsafe` code.
 //! * A lock of this crate is never held while handler code runs, so a handler cannot deadlock the bus by what it
 //!   does (subscribing, unsubscribing, publishing, or dropping a [`Subscription`]).
 //! * A panic in a handler is not caught: it unwinds through [`EventBus::publish`] to its caller.

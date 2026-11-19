@@ -1,5 +1,6 @@
 //! The queue behind `post` and `dispatch`.
 
+use std::any::TypeId;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,15 +8,33 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::bus::{EventBus, lock};
 
 /// A posted event, ready to be delivered: it owns the event and knows its type.
-pub(crate) type Queued = Box<dyn FnOnce(&EventBus) + Send>;
+pub(crate) struct Queued {
+    event_type: TypeId,
+    deliver: Box<dyn FnOnce(&EventBus) + Send>,
+}
+
+impl Queued {
+    /// The type of the event inside; `dispatch_parallel` groups by it.
+    pub(crate) fn event_type(&self) -> TypeId {
+        self.event_type
+    }
+
+    /// Delivers the event to the handlers of `bus`.
+    pub(crate) fn deliver(self, bus: &EventBus) {
+        (self.deliver)(bus);
+    }
+}
 
 /// Wraps `event` for the queue. Delivery runs the whole handler chain of the event's type, interceptors included
 /// (see [`EventBus::publish_mut`]): the queue owns the event, so it can lend out `&mut`.
 pub(crate) fn queued<E: Send + 'static>(event: E) -> Queued {
-    Box::new(move |bus: &EventBus| {
-        let mut event = event;
-        bus.publish_mut(&mut event);
-    })
+    Queued {
+        event_type: TypeId::of::<E>(),
+        deliver: Box::new(move |bus: &EventBus| {
+            let mut event = event;
+            bus.publish_mut(&mut event);
+        }),
+    }
 }
 
 /// The posted events of a bus, in the order in which they were posted.

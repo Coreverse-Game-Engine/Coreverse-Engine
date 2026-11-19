@@ -34,15 +34,23 @@ fn log_on<E: 'static>(
     bus.subscribe_with_priority(priority, move |_: &E| log.lock().unwrap().push(what))
 }
 
-/// Runs `work` on its own thread and fails the test if it has not finished after 20 seconds (a deadlock).
+/// How many repetitions a stress test runs: the full number natively, a few under Miri, which is orders of
+/// magnitude slower and only needs to see every code path.
+fn scaled(native: u32, under_miri: u32) -> u32 {
+    if cfg!(miri) { under_miri } else { native }
+}
+
+/// Runs `work` on its own thread and fails the test if it has not finished in time (a deadlock): after 20 seconds,
+/// or after 15 minutes under Miri.
 fn within_patience<T: Send + 'static>(what: &str, work: impl FnOnce() -> T + Send + 'static) -> T {
+    let patience = Duration::from_secs(if cfg!(miri) { 900 } else { 20 });
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let _ = sender.send(work());
     });
     receiver
-        .recv_timeout(Duration::from_secs(20))
-        .unwrap_or_else(|_| panic!("{what} did not finish within 20 seconds (deadlock or panic)"))
+        .recv_timeout(patience)
+        .unwrap_or_else(|_| panic!("{what} did not finish in time (deadlock or panic)"))
 }
 
 #[test]
@@ -396,16 +404,17 @@ fn many_threads_can_publish_at_once() {
         counter.fetch_add(1, Ordering::SeqCst);
     });
 
+    let rounds = scaled(1000, 25);
     thread::scope(|scope| {
         for _ in 0..4 {
             scope.spawn(|| {
-                for _ in 0..1000 {
+                for _ in 0..rounds {
                     bus.publish(&Ping);
                 }
             });
         }
     });
-    assert_eq!(hits.load(Ordering::SeqCst), 4000);
+    assert_eq!(hits.load(Ordering::SeqCst), 4 * rounds as usize);
 }
 
 #[test]
@@ -417,20 +426,22 @@ fn subscribing_and_unsubscribing_while_others_publish_is_safe() {
         counter.fetch_add(1, Ordering::SeqCst);
     });
 
+    let publishes = scaled(5000, 100);
+    let churns = scaled(2000, 40);
     thread::scope(|scope| {
         scope.spawn(|| {
-            for _ in 0..5000 {
+            for _ in 0..publishes {
                 bus.publish(&Ping);
             }
         });
         scope.spawn(|| {
-            for _ in 0..2000 {
+            for _ in 0..churns {
                 let churn = bus.subscribe(|_: &Ping| {});
                 drop(churn);
             }
         });
     });
 
-    assert_eq!(hits.load(Ordering::SeqCst), 5000);
+    assert_eq!(hits.load(Ordering::SeqCst), publishes as usize);
     assert_eq!(bus.subscriber_count::<Ping>(), 1);
 }

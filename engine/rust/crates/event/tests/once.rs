@@ -33,6 +33,12 @@ fn log_once(
     bus.subscribe_once_with_priority(priority, move |_: &Ping| log.lock().unwrap().push(what))
 }
 
+/// How many repetitions a stress test runs: the full number natively, a few under Miri, which is orders of
+/// magnitude slower and only needs to see every code path.
+fn scaled(native: u32, under_miri: u32) -> u32 {
+    if cfg!(miri) { under_miri } else { native }
+}
+
 #[test]
 fn a_once_handler_runs_once_and_is_removed() {
     let bus = EventBus::new();
@@ -128,10 +134,11 @@ fn threads_publishing_together_run_a_once_handler_exactly_once() {
         counter.fetch_add(1, Ordering::SeqCst);
     });
 
+    let rounds = scaled(500, 20);
     thread::scope(|scope| {
         for _ in 0..4 {
             scope.spawn(|| {
-                for _ in 0..500 {
+                for _ in 0..rounds {
                     bus.publish(&Ping);
                 }
             });

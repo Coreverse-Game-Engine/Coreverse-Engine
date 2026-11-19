@@ -3,12 +3,15 @@
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+
+use threading::Spawner;
 
 use crate::flow::{Dispatch, Flow};
 use crate::priority::EventPriority;
-use crate::queue::{Queue, queued};
+use crate::queue::{Queue, Queued, queued};
 use crate::sender::EventSender;
 use crate::subscription::Subscription;
 
@@ -578,8 +581,205 @@ impl EventBus {
         };
         let mut delivered = 0;
         while let Some(item) = pass.pop() {
-            item(self);
+            item.deliver(self);
             delivered += 1;
+        }
+        delivered
+    }
+
+    /// Like [`publish`](EventBus::publish), but runs the observers as jobs on the thread pool behind `spawner`,
+    /// and returns how many it called when all of them are done.
+    ///
+    /// * **Priorities are phases.** Observers of the same priority may run at the same time, in no particular
+    ///   order; every observer of a higher priority has finished before the first one of the next priority
+    ///   starts. (`publish` runs one observer after the other in subscription order; this method does not
+    ///   promise that order inside a priority.)
+    /// * **Observers only.** Interceptors need `&mut E` in a fixed order and are skipped, as in `publish`.
+    ///   The event is shared by the handlers that run at the same time, so it must be `Sync`.
+    /// * **One-shot handlers** still run exactly once, and unsubscribing, subscribing and the snapshot rules of
+    ///   [`EventBus`] are unchanged.
+    /// * **A panicking observer** does not stop the other observers of its phase; the first panic is re-raised
+    ///   when the phase is done, and the phases after it do not run (the threading crate's rule for scopes).
+    /// * **Where it can be called from.** A [`Spawner`] works anywhere, including inside a job; a thread that
+    ///   waits for the phase runs queued jobs meanwhile, so calling this from a job cannot starve a small pool.
+    ///   With a pool without workers (`WorkerCount::Exact(0)`) the observers run on the calling thread.
+    ///
+    /// Running a handler as a job costs more than calling it: use this for a few expensive observers, not for
+    /// many cheap ones.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use std::sync::atomic::{AtomicUsize, Ordering};
+    ///
+    /// use event::EventBus;
+    /// use threading::{PoolConfig, ThreadPool};
+    ///
+    /// struct Frame(u32);
+    ///
+    /// let pool = ThreadPool::new(PoolConfig::new())?;
+    /// let bus = EventBus::new();
+    /// let seen = Arc::new(AtomicUsize::new(0));
+    ///
+    /// let subscriptions: Vec<_> = (0..4)
+    ///     .map(|_| {
+    ///         let seen = Arc::clone(&seen);
+    ///         bus.subscribe(move |_: &Frame| {
+    ///             seen.fetch_add(1, Ordering::SeqCst);
+    ///         })
+    ///     })
+    ///     .collect();
+    ///
+    /// assert_eq!(bus.publish_parallel(&pool.spawner(), &Frame(1)), 4);
+    /// assert_eq!(seen.load(Ordering::SeqCst), 4);
+    /// drop(subscriptions);
+    /// # Ok::<(), threading::ThreadingError>(())
+    /// ```
+    ///
+    /// An event that is not `Sync` cannot be shared between jobs:
+    ///
+    /// ```compile_fail
+    /// use std::cell::Cell;
+    ///
+    /// use event::EventBus;
+    /// use threading::{PoolConfig, ThreadPool};
+    ///
+    /// let pool = ThreadPool::new(PoolConfig::new()).unwrap();
+    /// let bus = EventBus::new();
+    /// bus.publish_parallel(&pool.spawner(), &Cell::new(1));
+    /// ```
+    pub fn publish_parallel<E: Sync + 'static>(&self, spawner: &Spawner, event: &E) -> usize {
+        let Some(slots) = self.inner.snapshot::<E>() else {
+            return 0;
+        };
+        let mut called = 0;
+        let mut start = 0;
+        while start < slots.len() {
+            // The list is sorted by priority, so a phase is a run of slots of the same priority.
+            let priority = slots[start].priority;
+            let length = slots[start..]
+                .iter()
+                .take_while(|slot| slot.priority == priority)
+                .count();
+            let end = start + length;
+            called += self.run_phase(spawner, &slots[start..end], event);
+            start = end;
+        }
+        called
+    }
+
+    /// Runs the observers of one priority as jobs, one job each, and waits for them.
+    fn run_phase<E: Sync + 'static>(
+        &self,
+        spawner: &Spawner,
+        phase: &[Slot<E>],
+        event: &E,
+    ) -> usize {
+        let called = AtomicUsize::new(0);
+        spawner.parallel_chunks(0..phase.len(), 1, |range| {
+            for index in range {
+                let slot = &phase[index];
+                let Handler::Observer(handler) = &slot.handler else {
+                    continue;
+                };
+                if !self.inner.claim(slot) {
+                    continue;
+                }
+                (**handler)(event);
+                called.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        called.load(Ordering::Relaxed)
+    }
+
+    /// Like [`dispatch`](EventBus::dispatch), but delivers events of different types at the same time, as jobs on
+    /// the thread pool behind `spawner`, and returns how many events it delivered when all of them are done.
+    ///
+    /// * **Per type, in order; across types, at the same time.** The events of the pass are grouped by type. The
+    ///   events of one type are delivered one after the other in posting order, by one job; the groups run in
+    ///   parallel. Two events of different types are therefore not ordered against each other, which
+    ///   [`dispatch`](EventBus::dispatch) guarantees.
+    /// * **The same rules as `dispatch`:** one pass over the events queued at that moment, events posted during
+    ///   it wait for the next call, and a call while a pass is running (another thread, or a handler calling
+    ///   `dispatch` or `dispatch_parallel`) returns 0 at once. Each event is delivered like
+    ///   [`publish_mut`](EventBus::publish_mut).
+    /// * **A panicking handler loses only its own event.** The other events of the pass are still delivered, the
+    ///   pass waits for all jobs, and then the first panic is re-raised from this call. (`dispatch`, which can
+    ///   stop at once, puts the undelivered events back instead.)
+    ///
+    /// Handlers of different event types now may run at the same time, so state that they share needs the usual
+    /// synchronization; handlers are `Send + Sync` already, which is why this is safe.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use std::sync::atomic::{AtomicU32, Ordering};
+    ///
+    /// use event::EventBus;
+    /// use threading::{PoolConfig, ThreadPool};
+    ///
+    /// struct Physics(u32);
+    /// struct Audio(u32);
+    ///
+    /// let pool = ThreadPool::new(PoolConfig::new())?;
+    /// let bus = EventBus::new();
+    /// let total = Arc::new(AtomicU32::new(0));
+    ///
+    /// let sink = Arc::clone(&total);
+    /// let _physics = bus.subscribe(move |event: &Physics| {
+    ///     sink.fetch_add(event.0, Ordering::SeqCst);
+    /// });
+    /// let sink = Arc::clone(&total);
+    /// let _audio = bus.subscribe(move |event: &Audio| {
+    ///     sink.fetch_add(event.0, Ordering::SeqCst);
+    /// });
+    ///
+    /// bus.post(Physics(1));
+    /// bus.post(Audio(10));
+    /// bus.post(Physics(100));
+    ///
+    /// assert_eq!(bus.dispatch_parallel(&pool.spawner()), 3);
+    /// assert_eq!(total.load(Ordering::SeqCst), 111);
+    /// # Ok::<(), threading::ThreadingError>(())
+    /// ```
+    pub fn dispatch_parallel(&self, spawner: &Spawner) -> usize {
+        let Some(mut pass) = self.inner.queue.begin_pass() else {
+            return 0;
+        };
+
+        // Group the pass by event type, in order of first appearance; a group keeps the posting order.
+        let mut groups: Vec<Vec<Queued>> = Vec::new();
+        let mut group_of: HashMap<TypeId, usize> = HashMap::new();
+        let mut delivered = 0;
+        while let Some(item) = pass.pop() {
+            delivered += 1;
+            let at = *group_of.entry(item.event_type()).or_insert_with(|| {
+                groups.push(Vec::new());
+                groups.len() - 1
+            });
+            groups[at].push(item);
+        }
+
+        let first_panic: Mutex<Option<Box<dyn Any + Send>>> = Mutex::new(None);
+        if !groups.is_empty() {
+            spawner.parallel_chunks_mut(&mut groups, 1, |_, part: &mut [Vec<Queued>]| {
+                for group in part {
+                    for item in group.drain(..) {
+                        let outcome = catch_unwind(AssertUnwindSafe(|| item.deliver(self)));
+                        if let Err(payload) = outcome {
+                            let mut slot = lock(&first_panic);
+                            if slot.is_none() {
+                                *slot = Some(payload);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        let payload = first_panic
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(payload) = payload {
+            resume_unwind(payload);
         }
         delivered
     }

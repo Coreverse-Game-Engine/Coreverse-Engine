@@ -22,15 +22,23 @@ fn collect(bus: &EventBus) -> (Arc<Mutex<Vec<u32>>>, Subscription) {
     (seen, subscription)
 }
 
-/// Runs `work` on its own thread and fails the test if it has not finished after 20 seconds (a deadlock).
+/// How many repetitions a stress test runs: the full number natively, a few under Miri, which is orders of
+/// magnitude slower and only needs to see every code path.
+fn scaled(native: u32, under_miri: u32) -> u32 {
+    if cfg!(miri) { under_miri } else { native }
+}
+
+/// Runs `work` on its own thread and fails the test if it has not finished in time (a deadlock): after 20 seconds,
+/// or after 15 minutes under Miri.
 fn within_patience<T: Send + 'static>(what: &str, work: impl FnOnce() -> T + Send + 'static) -> T {
+    let patience = Duration::from_secs(if cfg!(miri) { 900 } else { 20 });
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let _ = sender.send(work());
     });
     receiver
-        .recv_timeout(Duration::from_secs(20))
-        .unwrap_or_else(|_| panic!("{what} did not finish within 20 seconds (deadlock or panic)"))
+        .recv_timeout(patience)
+        .unwrap_or_else(|_| panic!("{what} did not finish in time (deadlock or panic)"))
 }
 
 #[test]
@@ -273,19 +281,20 @@ fn events_posted_from_other_threads_keep_each_threads_order() {
         sink.lock().unwrap().push((tagged.0, tagged.1));
     });
 
+    let per_thread = scaled(500, 20);
     let sender = bus.sender();
     thread::scope(|scope| {
         for thread_id in 0..4 {
             let sender = sender.clone();
             scope.spawn(move || {
-                for sequence in 0..500 {
+                for sequence in 0..per_thread {
                     sender.post(Tagged(thread_id, sequence)).unwrap();
                 }
             });
         }
     });
 
-    assert_eq!(bus.dispatch(), 2000);
+    assert_eq!(bus.dispatch(), 4 * per_thread as usize);
     let seen = seen.lock().unwrap();
     for thread_id in 0..4 {
         let sequences: Vec<u32> = seen
@@ -293,7 +302,7 @@ fn events_posted_from_other_threads_keep_each_threads_order() {
             .filter(|(id, _)| *id == thread_id)
             .map(|(_, sequence)| *sequence)
             .collect();
-        assert_eq!(sequences, (0..500).collect::<Vec<u32>>());
+        assert_eq!(sequences, (0..per_thread).collect::<Vec<u32>>());
     }
 }
 
@@ -307,24 +316,26 @@ fn dispatching_while_producers_post_loses_nothing() {
             counter.fetch_add(1, Ordering::SeqCst);
         });
 
+        let per_producer = scaled(1000, 15);
+        let expected = 2 * per_producer as usize;
         thread::scope(|scope| {
             for _ in 0..2 {
                 let sender = bus.sender();
                 scope.spawn(move || {
-                    for _ in 0..1000 {
+                    for _ in 0..per_producer {
                         sender.post(Ping).unwrap();
                     }
                 });
             }
 
             let mut total = 0;
-            while total < 2000 {
+            while total < expected {
                 total += bus.dispatch();
                 thread::yield_now();
             }
         });
 
-        assert_eq!(delivered.load(Ordering::SeqCst), 2000);
+        assert_eq!(delivered.load(Ordering::SeqCst), expected);
         assert_eq!(bus.pending(), 0);
     });
 }
@@ -333,14 +344,16 @@ fn dispatching_while_producers_post_loses_nothing() {
 fn two_threads_dispatching_deliver_every_event_once_and_in_order() {
     let bus = EventBus::new();
     let (seen, _subscription) = collect(&bus);
-    for value in 0..2000 {
+    let total = scaled(2000, 60);
+    for value in 0..total {
         bus.post(Number(value));
     }
 
+    let attempts = scaled(50, 5);
     thread::scope(|scope| {
         for _ in 0..2 {
             scope.spawn(|| {
-                for _ in 0..50 {
+                for _ in 0..attempts {
                     bus.dispatch();
                 }
             });
@@ -350,7 +363,7 @@ fn two_threads_dispatching_deliver_every_event_once_and_in_order() {
         bus.dispatch();
     }
 
-    assert_eq!(*seen.lock().unwrap(), (0..2000).collect::<Vec<u32>>());
+    assert_eq!(*seen.lock().unwrap(), (0..total).collect::<Vec<u32>>());
 }
 
 #[test]

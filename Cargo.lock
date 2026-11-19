@@ -484,6 +484,9 @@ dependencies = [
 [[package]]
 name = "event"
 version = "0.1.0"
+dependencies = [
+ "threading",
+]
 
 [[package]]
 name = "fastrand"
