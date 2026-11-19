@@ -10,7 +10,7 @@ use platform::thread::ThreadPriority;
 
 use crate::config::PoolConfig;
 use crate::error::{ThreadingError, ThreadingResult};
-use crate::job::{JobHandle, Slot};
+use crate::job::{JobHandle, Slot, join_all};
 use crate::priority::JobPriority;
 use crate::queue::{Queues, Task};
 use crate::sleep::Sleep;
@@ -97,6 +97,15 @@ impl Shared {
             self.sleep.wake_one();
         }
         result
+    }
+
+    /// Like [`submit`](Self::submit), but a task the pool refuses runs on the calling thread instead of being
+    /// dropped. For work that must happen however late the call comes (continuations of finished jobs, graph
+    /// tasks), the same fallback a scoped job uses.
+    pub(crate) fn submit_or_run(&self, priority: JobPriority, task: Task) {
+        if let Err(task) = self.submit(priority, task) {
+            self.run_task(task);
+        }
     }
 
     /// The number of worker threads.
@@ -260,6 +269,33 @@ impl ThreadPool {
         }
     }
 
+    /// Returns a handle for a job that is done when every job of `handles` is done, with the results in the
+    /// order of the input. The handles are consumed.
+    ///
+    /// This is the counter-based dependency of the crate: nothing waits and nothing is queued; the job that
+    /// finishes last completes the returned handle. If jobs panicked, the handle reports the panic of the
+    /// first of them in input order (after all of them finished); the other panic payloads are dropped. An
+    /// empty input is done at once with an empty `Vec`.
+    ///
+    /// Combine it with [`JobHandle::then`] to run something after a whole group:
+    ///
+    /// ```
+    /// use threading::{PoolConfig, ThreadPool};
+    ///
+    /// let pool = ThreadPool::new(PoolConfig::new())?;
+    /// let parts: Vec<_> = (1..=4_u64).map(|n| pool.spawn(move || n * 10)).collect();
+    /// let total = pool.when_all(parts).then(|values| values.iter().sum::<u64>());
+    /// assert_eq!(total.wait(), 100);
+    /// # Ok::<(), threading::ThreadingError>(())
+    /// ```
+    pub fn when_all<T, I>(&self, handles: I) -> JobHandle<Vec<T>>
+    where
+        I: IntoIterator<Item = JobHandle<T>>,
+        T: Send + 'static,
+    {
+        join_all(&self.shared, handles.into_iter().collect())
+    }
+
     /// Runs queued jobs on the calling thread, one after the other, until nothing is queued, and returns how
     /// many it ran.
     ///
@@ -357,6 +393,15 @@ impl Spawner {
         T: Send + 'static,
     {
         self.shared.spawn_job(priority, job)
+    }
+
+    /// Like [`ThreadPool::when_all`]: a handle that is done when every job of `handles` is done.
+    pub fn when_all<T, I>(&self, handles: I) -> JobHandle<Vec<T>>
+    where
+        I: IntoIterator<Item = JobHandle<T>>,
+        T: Send + 'static,
+    {
+        join_all(&self.shared, handles.into_iter().collect())
     }
 }
 

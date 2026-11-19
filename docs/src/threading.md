@@ -1,10 +1,11 @@
 # Threading
 
 `engine/rust/crates/threading` is the engine's job system. It is being built in milestones; this page describes what
-exists (T1 foundation, T2 queues/priorities/spawners, T3 scoped jobs and parallel loops) and what is planned. The crate
-uses `std` only and has one `unsafe` block (see "Scoped jobs" below).
+exists (T1 foundation, T2 queues/priorities/spawners, T3 scoped jobs and parallel loops, T4 dependencies and task
+graphs) and what is planned. The crate uses `std` only and has one `unsafe` block (see "Scoped jobs" below); everything
+added in T4 is safe code on top of it.
 
-## What is there (T1, T2 and T3)
+## What is there (T1 to T4)
 
 | Item                                | Purpose                                                                                                                                              |
 |:------------------------------------|:-----------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -18,7 +19,12 @@ uses `std` only and has one `unsafe` block (see "Scoped jobs" below).
 | `PoolConfig`, `WorkerCount`         | The settings: worker count (`Auto` or `Exact(n)`), thread name prefix, thread priority. Chained `with_*` setters, `validate()`.                       |
 | `JobHandle<T>`                      | What `spawn` returns: `is_done()`, `wait()` (re-raises a panic), `wait_catch()` (returns the panic as a value).                                      |
 | `JobPanic`                          | A job's panic as a value: `message()`, `into_payload()`, `Display`, `Error`.                                                                          |
-| `ThreadingError`, `ThreadingResult` | `InvalidConfig`, `Spawn` and `PoolClosed`. `#[non_exhaustive]`, convertible into `ccore::CoreError`.                                                                |
+| `JobHandle::then`                   | `handle.then(f)` / `then_with_priority(priority, f)`, `f` taking the job's result: queues a continuation when the job finishes; nobody waits. A panic skips it and travels on. |
+| `when_all`                          | `pool.when_all(handles)` (also on `Spawner`): a handle that is done when every job of a group is, with the results in input order.                   |
+| `TaskGraph`, `TaskId`               | A DAG of `FnMut` tasks. `add`, `add_after(name, &deps, f)`, `depend(task, after)` (refuses a cycle), `set_priority`, `name`, `dependencies`, `dependents`, `topological_order`. |
+| `run_graph`, `run_graph_catch`      | `pool.run_graph(&mut graph)` (also on `Spawner`): runs the graph with a counter per task; re-raises the first panic, or `run_graph_catch` returns a `GraphPanic`. |
+| `GraphPanic`                        | The failed task (`task()`, `task_name()`), its `panic()` and how many tasks were skipped because of it (`skipped_tasks()`).                          |
+| `ThreadingError`, `ThreadingResult` | `InvalidConfig`, `Spawn`, `PoolClosed`, `DependencyCycle { path }` and `UnknownTask`. `#[non_exhaustive]`, convertible into `ccore::CoreError`.         |
 | `ThreadPriority`                    | Re-exported from `platform::thread`.                                                                                                                  |
 
 ```rust,ignore
@@ -114,7 +120,7 @@ pool.parallel_for(0..1_000, |i| {
 * **No lock is held while job code runs.** The crate's mutexes only guard a few lines of its own queue and slot
   code, so what a job does inside its closure cannot deadlock the pool through them. Poisoned locks are taken back
   instead of propagating a panic.
-* **Closures are `Send + 'static`.** Jobs that borrow from the caller's stack need scoped jobs (T3).
+* **Closures are `Send + 'static`.** Jobs that borrow from the caller's stack need scoped jobs (T3) or a task graph (T4).
 
 ## Scoped jobs, `join` and the parallel loops (T3)
 
@@ -149,12 +155,82 @@ the scope never lets the borrowed data go while a job can still touch it:
    wait itself ever unwound, an abort guard stops the process instead of freeing the stack frame under the jobs);
 4. the counter lives under a mutex, so the jobs' writes are visible to the caller when it returns;
 5. `'scope` is invariant and higher-ranked, as in `std::thread::scope`, so a `&Scope` cannot escape and a job can only
-   borrow data that outlives the whole call.
+   borrow data that outlives the whole call;
+6. releasing the scope happens only after the job's call has returned: the task closure captures the job behind a
+   `Box` and moves it onto its own stack frame, so that no reference hidden in a by-value closure environment is still
+   a protected function argument (in Miri's Stacked Borrows model) when the counter reaches 0 and the caller reads what
+   the job wrote through its `&mut`. Without the `Box`, Miri reported this as undefined behaviour even though no data
+   race existed; `scope.rs` has a regression test for it.
 
 The compiler rejects the misuse cases (a job borrowing something that dies with the body, a `&Scope` escaping,
 two jobs borrowing the same variable mutably, reading what a job may change, capturing a non-`Send` value, using a
 value after moving it into a job); each is a `compile_fail` doc test on `Scope`. Miri is the tool that checks the one
 `unsafe` block at run time; see "Running Miri" below.
+
+## Dependencies and task graphs (T4)
+
+Two layers, both built from safe code on the scoped-job machinery of T3, and both free of blocking: no thread ever
+sits in a worker waiting for a dependency.
+
+### `then` and `when_all`
+
+```rust,ignore
+// A chain: each step is queued by the thread that finished the one before it.
+let text = pool.spawn(|| 20).then(|n| n + 1).then(|n| format!("answer {}", n * 2));
+assert_eq!(text.wait(), "answer 42");
+
+// A group: done when the last of its jobs is; results in input order.
+let parts: Vec<_> = (1..=4_u64).map(|n| pool.spawn(move || n * 10)).collect();
+let total = pool.when_all(parts).then(|values| values.iter().sum::<u64>());
+assert_eq!(total.wait(), 100);
+```
+
+* A continuation is an ordinary job, queued with `Normal` priority (`then_with_priority` chooses). It is queued by the
+  thread that completes the job it follows, or at once when the job is done already. Calling `then` consumes the handle.
+* **Panics travel.** If a job panics, its continuations do not run; the panic payload goes on to the new handle, and
+  `wait` re-raises the original payload at the end of the chain. A panic inside a continuation is reported by that
+  continuation's handle.
+* `when_all` keeps a counter of the jobs that have not finished. The job that brings it to 0 completes the returned
+  handle itself (no job is queued for the join). When several jobs panicked, the panic of the first one in input order
+  is reported after all of them finished; the other payloads are dropped. An empty group is done at once.
+* With no workers, a continuation waits in the queue like any job and runs when somebody waits or calls `run_pending`.
+  That mode is meant to be driven by one thread; several threads waiting on one worker-less pool is not supported.
+
+### `TaskGraph`
+
+```rust,ignore
+let mut graph = TaskGraph::new();
+let load = graph.add("load", || load_assets(&assets));
+let physics = graph.add_after("physics", &[load], || step_physics(&world))?;
+let animation = graph.add_after("animation", &[load], || step_animation(&world))?;
+graph.add_after("render", &[physics, animation], || submit_frame(&world))?;
+graph.set_priority(physics, JobPriority::High)?;
+
+pool.run_graph(&mut graph); // blocks until every task has run; run it again next frame
+```
+
+* **Building.** `add` makes a task without dependencies, `add_after(name, &deps, f)` one that waits for `deps`, `depend(task,
+  after)` adds an edge later. A task is an `FnMut() + Send` closure; it returns nothing and hands results back through
+  what it borrows, like a scoped job. `FnMut` is what lets the same graph run every frame. Names are for errors and
+  tools and need not be unique.
+* **Cycles are errors at build time.** `depend` refuses an edge that would close a cycle and returns
+  `ThreadingError::DependencyCycle { path }` (for example `a -> b -> c -> a`; `a -> b` means `a` runs before `b`),
+  leaving the graph unchanged. A task depending on itself is a cycle too. `add_after` cannot create one (a new task has no
+  dependents), so its only error is `UnknownTask`: an id that another graph made. Adding an edge twice is harmless.
+* **Running.** `run_graph` is a scope: it starts the tasks with no dependencies, and when a task finishes it lowers the
+  counter of each dependent; the task that brings a counter to 0 is queued with its own priority. The calling thread
+  helps like any thread that waits for a scope, so a pool without workers runs a graph too, and a job can run a graph
+  through its `Spawner`. Tasks may borrow from the caller's stack. A graph can be run again afterwards.
+* **Order.** A task never starts before all its dependencies finished (a priority never overrides that); among tasks that
+  are ready at the same time, a higher priority starts first. With no workers and equal priorities the tasks run in
+  `topological_order()` (a breadth-first order that is the same on every call). With workers nothing more is promised.
+* **Panics.** A task that panics does not stop the run: tasks that do not depend on it still run. Every task that
+  depends on it, directly or not, is **skipped** (it never runs; its closure is dropped with the graph). When everything
+  else is done, `run_graph` re-raises the panic of the failed task with the smallest `TaskId::index()`, the same one on
+  every run; `run_graph_catch` returns it as a `GraphPanic` that also says how many tasks were skipped. The graph is
+  intact afterwards, so it can be run again.
+* **Why the checking is here and the conflict analysis is not.** The ECS scheduler will compute which systems conflict
+  (who reads and writes which component) and turn that into edges; this crate only runs the resulting graph.
 
 ## Running Miri
 
@@ -167,6 +243,7 @@ cargo +nightly miri test -p threading --lib
 cargo +nightly miri test -p threading --test pool
 cargo +nightly miri test -p threading --test scheduling
 cargo +nightly miri test -p threading --test scoped
+cargo +nightly miri test -p threading --test graph
 cargo +nightly miri test -p threading --doc
 ```
 
@@ -190,7 +267,7 @@ cargo +nightly miri test -p threading --doc
 | T1        | Done: pool, `spawn`, `JobHandle`, panic propagation, shutdown, single-threaded mode, help while waiting.                                            |
 | T2        | Done: per-worker queues with stealing, three priorities (`High`/`Normal`/`Low`), `Spawner` for jobs that spawn jobs, `worker_index()`.              |
 | T3        | Done: `scope`, `join`, `parallel_for`, `parallel_chunks`, `parallel_for_each` (and `_mut` variants): jobs that borrow from the stack. The first `unsafe` module of the crate. |
-| T4        | Dependencies between jobs (`then`, counters) and a `TaskGraph` with cycle detection, for the ECS scheduler.                                         |
+| T4        | Done: `JobHandle::then`, `when_all` (counter-based dependencies) and `TaskGraph` with cycle detection when it is built, run with a counter per task; for the ECS scheduler. |
 | T5        | Dedicated threads (render, audio), a separate IO pool for blocking work, a main-thread marker and `ThreadRole` assertions.                          |
 | T6        | Observer hooks for the profiler, per-worker statistics, per-worker scratch arenas on top of `memory`.                                               |
 | T7        | criterion benchmarks, the rest of the documentation, an optional Miri/loom job (the `scope` module is what it is for).                              |

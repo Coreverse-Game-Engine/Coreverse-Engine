@@ -1,9 +1,9 @@
 //! `threading` — the job system of the Coreverse Engine: a thread pool that runs closures as jobs and gets
 //! their results (or panics) back to the code that spawned them.
 //!
-//! The crate is built in milestones. This is **T3: scoped jobs and parallel loops**, on top of T1 (the
-//! foundation) and T2 (queues, stealing, priorities, spawners); dependencies between jobs and dedicated threads
-//! follow (see `docs/src/threading.md`).
+//! The crate is built in milestones. This is **T4: dependencies and task graphs**, on top of T1 (the
+//! foundation), T2 (queues, stealing, priorities, spawners) and T3 (scoped jobs, parallel loops); dedicated
+//! threads follow (see `docs/src/threading.md`).
 //!
 //! # What is here today
 //!
@@ -31,6 +31,14 @@
 //!   [`parallel_chunks_mut`](ThreadPool::parallel_chunks_mut): data-parallel loops over index ranges and
 //!   slices, with chunk boundaries that do not depend on scheduling. A [`Spawner`] has the same operations,
 //!   so a job can parallelize its own work.
+//! * [`JobHandle::then`] and [`ThreadPool::when_all`]: dependencies between jobs without blocking anybody. A
+//!   continuation is queued by the thread that finishes the job it follows; `when_all` is done when the last
+//!   of a group of jobs is. A panic travels along the chain instead of running the continuation.
+//! * [`TaskGraph`]: a graph of tasks (closures) with dependencies. A dependency that would close a cycle is
+//!   refused when it is added ([`ThreadingError::DependencyCycle`], with the path). [`ThreadPool::run_graph`]
+//!   runs it with a counter per task, in parallel, with tasks that may borrow from the caller's stack; a task
+//!   that panics makes its dependents skip (the rest still runs) and the first panic is re-raised, or returned
+//!   by [`run_graph_catch`](ThreadPool::run_graph_catch) as a [`GraphPanic`].
 //! * Help while waiting: a thread that waits for a job runs queued jobs instead of sleeping, so a job that
 //!   waits for another job cannot deadlock a small pool.
 //! * [`WorkerCount::Exact(0)`](WorkerCount::Exact): a pool with no threads at all. Jobs then run on the thread
@@ -51,10 +59,11 @@
 //!
 //! * `std` only (no `no_std` mode). The crate has exactly one `unsafe` block, in the private `scope` module
 //!   (it hides the lifetime of a scoped job from the queues); the module documents the invariants that make
-//!   it sound, and the public API is safe.
+//!   it sound, and the public API is safe. Task graphs and continuations are built from safe code on top of
+//!   it.
 //! * Jobs started with [`ThreadPool::spawn`] are `Send + 'static`; jobs that borrow from the caller use
 //!   [`ThreadPool::scope`].
-//! * A `Mutex` of this crate is never held while job code runs, so a job cannot deadlock the pool by what it
+//! * A `Mutex` of this crate is never held while job code (a job, a continuation or a graph task) runs, so a job cannot deadlock the pool by what it
 //!   does inside its closure.
 //!
 //! The OS-level thread name and priority come from [`platform::thread`]; [`ThreadPriority`] is re-exported
@@ -62,6 +71,7 @@
 
 mod config;
 mod error;
+mod graph;
 mod job;
 mod parallel;
 mod pool;
@@ -78,6 +88,7 @@ mod worker;
 
 pub use config::{DEFAULT_NAME_PREFIX, MAX_WORKERS, PoolConfig, WorkerCount};
 pub use error::{ThreadingError, ThreadingResult};
+pub use graph::{GraphPanic, TaskGraph, TaskId};
 pub use job::{JobHandle, JobPanic};
 pub use platform::thread::ThreadPriority;
 pub use pool::{Spawner, ThreadPool};

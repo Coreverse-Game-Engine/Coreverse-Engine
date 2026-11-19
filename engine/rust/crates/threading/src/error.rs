@@ -35,6 +35,20 @@ pub enum ThreadingError {
     /// being dropped.
     #[error("the thread pool has shut down")]
     PoolClosed,
+
+    /// A dependency would make a [`TaskGraph`](crate::TaskGraph) cyclic, so its tasks could never all run.
+    /// The graph is left as it was.
+    #[error("the dependency would create a cycle: {}", .path.join(" -> "))]
+    DependencyCycle {
+        /// The names of the tasks on the cycle, in the order they would have to run (`a -> b` means `a` runs
+        /// before `b`). The first and the last name are the same task.
+        path: Vec<String>,
+    },
+
+    /// A [`TaskId`](crate::TaskId) does not belong to the graph it was used with (it was made by another
+    /// graph).
+    #[error("the task id does not belong to this graph")]
+    UnknownTask,
 }
 
 /// Shorthand for `Result<T, ThreadingError>`.
@@ -47,6 +61,9 @@ impl From<ThreadingError> for CoreError {
             ThreadingError::InvalidConfig { .. } => CoreError::InvalidArgument(message),
             ThreadingError::Spawn { .. } => CoreError::Io(message),
             ThreadingError::PoolClosed => CoreError::InvalidState(message),
+            ThreadingError::DependencyCycle { .. } | ThreadingError::UnknownTask => {
+                CoreError::InvalidArgument(message)
+            }
         }
     }
 }
@@ -93,5 +110,23 @@ mod tests {
         assert!(matches!(spawn, CoreError::Io(_)));
         let closed: CoreError = ThreadingError::PoolClosed.into();
         assert!(matches!(closed, CoreError::InvalidState(_)));
+        let cycle: CoreError = ThreadingError::DependencyCycle {
+            path: vec!["a".to_owned(), "a".to_owned()],
+        }
+        .into();
+        assert!(matches!(cycle, CoreError::InvalidArgument(_)));
+        let unknown: CoreError = ThreadingError::UnknownTask.into();
+        assert!(matches!(unknown, CoreError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn a_cycle_error_prints_the_path() {
+        let err = ThreadingError::DependencyCycle {
+            path: vec!["load".to_owned(), "parse".to_owned(), "load".to_owned()],
+        };
+        assert_eq!(
+            err.to_string(),
+            "the dependency would create a cycle: load -> parse -> load"
+        );
     }
 }

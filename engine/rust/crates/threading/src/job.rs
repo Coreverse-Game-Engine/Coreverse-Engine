@@ -3,14 +3,26 @@
 use std::any::Any;
 use std::fmt;
 use std::mem;
-use std::panic;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::pool::Shared;
+use crate::priority::JobPriority;
+use crate::queue::Task;
 use crate::sync::lock;
 
 /// The payload of a panic, as `catch_unwind` hands it out.
 pub(crate) type PanicPayload = Box<dyn Any + Send + 'static>;
+
+/// Code that takes over the result of a job when it finishes, instead of a waiting thread (see
+/// [`Slot::on_complete`]). It runs on whichever thread finishes the job, outside every lock, and must not
+/// panic.
+pub(crate) type Continuation<T> = Box<dyn FnOnce(Result<T, PanicPayload>) + Send + 'static>;
+
+/// Drops a panic payload without letting a panic in its destructor escape.
+pub(crate) fn discard_payload(payload: PanicPayload) {
+    let _ = panic::catch_unwind(AssertUnwindSafe(move || drop(payload)));
+}
 
 /// Where the result of one job is stored until somebody waits for it.
 pub(crate) struct Slot<T> {
@@ -21,6 +33,9 @@ pub(crate) struct Slot<T> {
 enum SlotState<T> {
     /// The job has not finished.
     Pending,
+    /// The job has not finished, and `continuation` takes over its result when it does. The result never
+    /// reaches the slot.
+    Continued(Continuation<T>),
     /// The job finished; nobody has taken the result yet.
     Ready(Result<T, PanicPayload>),
     /// The result has been taken. Cannot be seen through a [`JobHandle`], which is consumed by the wait that
@@ -36,14 +51,48 @@ impl<T> Slot<T> {
         }
     }
 
-    /// Stores the result and wakes whoever waits for it.
+    /// Stores the result and wakes whoever waits for it, or hands it to the continuation registered with
+    /// [`on_complete`](Self::on_complete).
     pub(crate) fn complete(&self, result: Result<T, PanicPayload>) {
-        *lock(&self.state) = SlotState::Ready(result);
-        self.ready.notify_all();
+        let mut state = lock(&self.state);
+        match mem::replace(&mut *state, SlotState::Taken) {
+            SlotState::Pending => {
+                *state = SlotState::Ready(result);
+                drop(state);
+                self.ready.notify_all();
+            }
+            SlotState::Continued(continuation) => {
+                // The state stays `Taken`: the result has been passed on.
+                drop(state);
+                continuation(result);
+            }
+            SlotState::Ready(_) | SlotState::Taken => {
+                unreachable!("a job completes exactly once")
+            }
+        }
+    }
+
+    /// Registers `continuation` to take over the result. If the job is done already the continuation runs
+    /// right now on this thread, otherwise on the thread that completes the job. Either way it runs once,
+    /// outside every lock.
+    ///
+    /// Only for a slot nobody else waits on: the handle that owned it has been consumed.
+    pub(crate) fn on_complete(&self, continuation: Continuation<T>) {
+        let mut state = lock(&self.state);
+        match mem::replace(&mut *state, SlotState::Taken) {
+            SlotState::Pending => *state = SlotState::Continued(continuation),
+            SlotState::Ready(result) => {
+                drop(state);
+                continuation(result);
+            }
+            SlotState::Continued(_) | SlotState::Taken => {
+                unreachable!("a handle is consumed by the call that registers a continuation")
+            }
+        }
     }
 
     fn is_done(&self) -> bool {
-        !matches!(*lock(&self.state), SlotState::Pending)
+        matches!(*lock(&self.state), SlotState::Ready(_) | SlotState::Taken)
     }
 
     /// Takes the result if the job is done, without blocking.
@@ -51,8 +100,8 @@ impl<T> Slot<T> {
         let mut state = lock(&self.state);
         match mem::replace(&mut *state, SlotState::Taken) {
             SlotState::Ready(result) => Some(result),
-            SlotState::Pending => {
-                *state = SlotState::Pending;
+            unfinished @ (SlotState::Pending | SlotState::Continued(_)) => {
+                *state = unfinished;
                 None
             }
             SlotState::Taken => None,
@@ -62,7 +111,7 @@ impl<T> Slot<T> {
     /// Blocks until the job is done and takes the result.
     fn take_blocking(&self) -> Result<T, PanicPayload> {
         let mut state = lock(&self.state);
-        while matches!(*state, SlotState::Pending) {
+        while matches!(*state, SlotState::Pending | SlotState::Continued(_)) {
             state = self
                 .ready
                 .wait(state)
@@ -70,7 +119,7 @@ impl<T> Slot<T> {
         }
         match mem::replace(&mut *state, SlotState::Taken) {
             SlotState::Ready(result) => result,
-            SlotState::Pending | SlotState::Taken => {
+            SlotState::Pending | SlotState::Continued(_) | SlotState::Taken => {
                 unreachable!(
                     "the loop above only ends on a finished job, and a handle is consumed by its wait"
                 )
@@ -191,6 +240,140 @@ impl<T> JobHandle<T> {
     }
 }
 
+impl<T: Send + 'static> JobHandle<T> {
+    /// Queues `next` to run with this job's result once the job has finished, and returns the handle for
+    /// `next`'s result. The job's handle is consumed.
+    ///
+    /// Nothing waits: no thread is blocked while the first job runs, and `next` is queued by whichever thread
+    /// finishes it (or right away, when the job is done already). `next` is queued with
+    /// [`JobPriority::Normal`]; see [`then_with_priority`](Self::then_with_priority).
+    ///
+    /// If the job panics, `next` does not run: the panic travels on to the new handle, which re-raises it (or
+    /// returns it as a [`JobPanic`]) exactly like the original handle would have. Chains therefore carry the
+    /// first failure to the end.
+    ///
+    /// ```
+    /// use threading::{PoolConfig, ThreadPool};
+    ///
+    /// let pool = ThreadPool::new(PoolConfig::new())?;
+    /// let text = pool
+    ///     .spawn(|| 20)
+    ///     .then(|n| n + 1)
+    ///     .then(|n| format!("the answer is {}", n * 2));
+    /// assert_eq!(text.wait(), "the answer is 42");
+    /// # Ok::<(), threading::ThreadingError>(())
+    /// ```
+    ///
+    /// With a pool without workers ([`WorkerCount::Exact(0)`](crate::WorkerCount::Exact)) the continuation
+    /// is queued like any other job: it runs on the thread that waits for it or calls
+    /// [`run_pending`](crate::ThreadPool::run_pending).
+    pub fn then<F, U>(self, next: F) -> JobHandle<U>
+    where
+        F: FnOnce(T) -> U + Send + 'static,
+        U: Send + 'static,
+    {
+        self.then_with_priority(JobPriority::Normal, next)
+    }
+
+    /// Like [`then`](Self::then), with the priority of the continuation.
+    pub fn then_with_priority<F, U>(self, priority: JobPriority, next: F) -> JobHandle<U>
+    where
+        F: FnOnce(T) -> U + Send + 'static,
+        U: Send + 'static,
+    {
+        let output = Arc::new(Slot::new());
+        let handle = JobHandle::new(Arc::clone(&output), Arc::clone(&self.shared));
+        let shared = Arc::clone(&self.shared);
+        self.slot.on_complete(Box::new(move |result| match result {
+            Err(payload) => output.complete(Err(payload)),
+            Ok(value) => {
+                let task: Task = Box::new(move || {
+                    let result = panic::catch_unwind(AssertUnwindSafe(move || next(value)));
+                    output.complete(result);
+                });
+                shared.submit_or_run(priority, task);
+            }
+        }));
+        handle
+    }
+}
+
+/// What [`join_all`] collects while its jobs finish.
+struct Gather<T> {
+    state: Mutex<GatherState<T>>,
+    output: Arc<Slot<Vec<T>>>,
+}
+
+struct GatherState<T> {
+    /// One entry per input job, in input order; `None` until that job has finished.
+    results: Vec<Option<Result<T, PanicPayload>>>,
+    /// How many jobs have not finished yet. The job that brings it to 0 completes the output.
+    remaining: usize,
+}
+
+impl<T> Gather<T> {
+    fn finish(&self, index: usize, result: Result<T, PanicPayload>) {
+        let finished = {
+            let mut state = lock(&self.state);
+            state.results[index] = Some(result);
+            state.remaining -= 1;
+            if state.remaining == 0 {
+                Some(mem::take(&mut state.results))
+            } else {
+                None
+            }
+        };
+        let Some(results) = finished else { return };
+
+        let mut values = Vec::with_capacity(results.len());
+        let mut first_panic: Option<PanicPayload> = None;
+        for result in results.into_iter().flatten() {
+            match result {
+                Ok(value) => values.push(value),
+                Err(payload) if first_panic.is_none() => first_panic = Some(payload),
+                Err(payload) => discard_payload(payload),
+            }
+        }
+        match first_panic {
+            Some(payload) => {
+                drop(values);
+                self.output.complete(Err(payload));
+            }
+            None => self.output.complete(Ok(values)),
+        }
+    }
+}
+
+/// A job that finishes when every job of `handles` has finished: the counter-based dependency that
+/// [`ThreadPool::when_all`](crate::ThreadPool::when_all) is made of. Nothing waits and no job is queued: the
+/// last of the jobs to finish completes the returned handle.
+pub(crate) fn join_all<T>(shared: &Arc<Shared>, handles: Vec<JobHandle<T>>) -> JobHandle<Vec<T>>
+where
+    T: Send + 'static,
+{
+    let output = Arc::new(Slot::new());
+    let joined = JobHandle::new(Arc::clone(&output), Arc::clone(shared));
+    if handles.is_empty() {
+        output.complete(Ok(Vec::new()));
+        return joined;
+    }
+
+    let gather = Arc::new(Gather {
+        state: Mutex::new(GatherState {
+            results: handles.iter().map(|_| None).collect(),
+            remaining: handles.len(),
+        }),
+        output,
+    });
+    for (index, handle) in handles.into_iter().enumerate() {
+        let gather = Arc::clone(&gather);
+        handle
+            .slot
+            .on_complete(Box::new(move |result| gather.finish(index, result)));
+    }
+    joined
+}
+
 impl<T> fmt::Debug for JobHandle<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("JobHandle")
@@ -232,6 +415,41 @@ mod tests {
     fn debug_shows_the_message() {
         let text = format!("{:?}", panic_with("boom"));
         assert!(text.contains("boom"), "{text}");
+    }
+
+    #[test]
+    fn a_continuation_registered_first_gets_the_result_when_the_job_completes() {
+        let slot = Slot::<u32>::new();
+        let seen = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&seen);
+        slot.on_complete(Box::new(move |result| {
+            *sink.lock().unwrap() = Some(result.ok());
+        }));
+        assert!(!slot.is_done(), "a continued slot is not done");
+        assert!(
+            slot.try_take().is_none(),
+            "nobody can take a continued result"
+        );
+        assert!(seen.lock().unwrap().is_none());
+        slot.complete(Ok(9));
+        assert_eq!(*seen.lock().unwrap(), Some(Some(9)));
+        assert!(slot.is_done());
+    }
+
+    #[test]
+    fn a_continuation_registered_late_runs_at_once_with_the_result() {
+        let slot = Slot::<u32>::new();
+        slot.complete(Err(Box::new("late")));
+        let seen = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&seen);
+        slot.on_complete(Box::new(move |result| {
+            *sink.lock().unwrap() = Some(
+                result
+                    .err()
+                    .and_then(|p| p.downcast_ref::<&str>().map(|text| (*text).to_owned())),
+            );
+        }));
+        assert_eq!(*seen.lock().unwrap(), Some(Some("late".to_owned())));
     }
 
     #[test]
