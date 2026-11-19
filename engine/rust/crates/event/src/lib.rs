@@ -1,8 +1,9 @@
 //! `event` — the event infrastructure of the Coreverse Engine: a typed publish/subscribe bus that calls handlers
 //! synchronously, in a defined order, with subscriptions that clean up after themselves.
 //!
-//! The crate is built in milestones. This is **E2**: the synchronous bus (E1) plus interceptors, cancellable
-//! events and one-shot handlers. Queued events and the cross-thread layer follow (see `docs/src/event.md`).
+//! The crate is built in milestones. This is **E3**: the synchronous bus (E1), interceptors, cancellable events
+//! and one-shot handlers (E2), and queued events with a cross-thread sender (E3). Running handlers as jobs
+//! follows (see `docs/src/event.md`).
 //!
 //! # What is here today
 //!
@@ -16,6 +17,10 @@
 //!   [`Cancellable`] wraps an event with a veto flag.
 //! * One-shot handlers: [`subscribe_once`](EventBus::subscribe_once) takes an `FnOnce`, runs it for the first event
 //!   and unsubscribes it.
+//! * Queued events: [`post`](EventBus::post) stores an event, [`dispatch`](EventBus::dispatch) delivers what is
+//!   stored, in posting order, at a moment the owner chooses (say, once per frame).
+//!   [`EventSender`] ([`EventBus::sender`]) is the cloneable handle that other threads post with; it does not keep
+//!   the bus alive and returns a [`PostError`] once the bus is gone.
 //! * [`Subscription`]: what `subscribe` returns. **Dropping it unsubscribes the handler**;
 //!   [`detach`](Subscription::detach) keeps the handler for the life of the bus.
 //! * [`EventPriority`]: `High`, `Normal` (default) and `Low`. Same priority: subscription order.
@@ -49,10 +54,13 @@ mod bus;
 mod cancellable;
 mod flow;
 mod priority;
+mod queue;
+mod sender;
 mod subscription;
 
 pub use bus::{EventBus, WeakEventBus};
 pub use cancellable::Cancellable;
 pub use flow::{Dispatch, Flow};
 pub use priority::EventPriority;
+pub use sender::{EventSender, PostError};
 pub use subscription::Subscription;

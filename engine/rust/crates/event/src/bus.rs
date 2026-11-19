@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use crate::flow::{Dispatch, Flow};
 use crate::priority::EventPriority;
+use crate::queue::{Queue, queued};
+use crate::sender::EventSender;
 use crate::subscription::Subscription;
 
 /// The handler list of one event type, shared with the `publish` calls that are running. It is replaced, never
@@ -23,7 +25,7 @@ const CHANNEL_MISMATCH: &str = "a channel holds the handler list of its TypeId's
 ///
 /// Handler code never runs while this lock is held, so a poisoned lock can only come from a bug in the few lines
 /// of this module that run under it; those lines leave the map consistent at every point where they could panic.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -79,6 +81,8 @@ impl<E> Clone for Slot<E> {
 pub(crate) struct Inner {
     next_id: AtomicU64,
     channels: Mutex<HashMap<TypeId, Channel>>,
+    /// The events posted and not yet dispatched.
+    pub(crate) queue: Queue,
 }
 
 impl Inner {
@@ -86,6 +90,7 @@ impl Inner {
         Self {
             next_id: AtomicU64::new(0),
             channels: Mutex::new(HashMap::new()),
+            queue: Queue::new(),
         }
     }
 
@@ -182,8 +187,9 @@ impl Inner {
 ///
 /// Any `'static` type is an event. [`subscribe`](EventBus::subscribe) registers a handler for one event type and
 /// returns a [`Subscription`]; [`publish`](EventBus::publish) calls the handlers of the event's type, on the
-/// calling thread, before it returns. Nothing is queued: the queued and cross-thread layers come in later
-/// milestones.
+/// calling thread, before it returns. [`post`](EventBus::post) queues an event instead, and
+/// [`dispatch`](EventBus::dispatch) delivers the queued events at a moment the owner of the bus chooses (for
+/// example once per frame); an [`EventSender`] lets other threads post.
 ///
 /// `EventBus` is a handle: cloning it gives another handle to the same bus, and the bus lives until the last
 /// handle is dropped. It is `Send + Sync`, so any thread may subscribe, unsubscribe and publish.
@@ -506,6 +512,98 @@ impl EventBus {
         self.inner.count::<E>()
     }
 
+    /// Queues `event` to be delivered by the next [`dispatch`](EventBus::dispatch). Nothing runs now.
+    ///
+    /// Any thread may post, so the event must be `Send`. Events are delivered in the order in which they were
+    /// posted, whatever their types; events of one thread keep that thread's order. The handlers that exist when
+    /// the event is *dispatched* receive it, not the ones that existed when it was posted.
+    ///
+    /// A queued event is owned by the queue, so it is delivered like [`publish_mut`](EventBus::publish_mut): every
+    /// handler of its type runs, observers, interceptors and one-shot handlers alike, and `Flow::Stop` ends the
+    /// chain. Nobody is left to read what interceptors change.
+    ///
+    /// The queue is unbounded; a producer that outpaces `dispatch` makes it grow.
+    ///
+    /// ```
+    /// use std::sync::{Arc, Mutex};
+    ///
+    /// use event::EventBus;
+    ///
+    /// struct Spawned(u32);
+    ///
+    /// let bus = EventBus::new();
+    /// let seen = Arc::new(Mutex::new(Vec::new()));
+    /// let sink = Arc::clone(&seen);
+    /// let _subscription = bus.subscribe(move |spawned: &Spawned| {
+    ///     sink.lock().unwrap().push(spawned.0);
+    /// });
+    ///
+    /// bus.post(Spawned(1));
+    /// bus.post(Spawned(2));
+    /// assert!(seen.lock().unwrap().is_empty(), "nothing has run yet");
+    /// assert_eq!(bus.pending(), 2);
+    ///
+    /// assert_eq!(bus.dispatch(), 2); // for example once per frame
+    /// assert_eq!(*seen.lock().unwrap(), [1, 2]);
+    /// ```
+    ///
+    /// An event that is not `Send` cannot be posted:
+    ///
+    /// ```compile_fail
+    /// use std::rc::Rc;
+    ///
+    /// use event::EventBus;
+    ///
+    /// let bus = EventBus::new();
+    /// bus.post(Rc::new(1));
+    /// ```
+    pub fn post<E: Send + 'static>(&self, event: E) {
+        self.inner.queue.push(queued(event));
+    }
+
+    /// Delivers the events that are queued right now, in posting order, on this thread, and returns how many it
+    /// delivered (an event nobody listens to counts too).
+    ///
+    /// * **One pass.** Events posted while the pass runs, by handlers or by other threads, wait for the next
+    ///   call. Call `dispatch` again, for example once per frame, to deliver them.
+    /// * **One pass at a time.** If a pass is already running, on another thread or because a handler called
+    ///   `dispatch` while being dispatched, this call returns 0 at once and leaves the queue to the running pass.
+    ///   Events are therefore never delivered concurrently or out of order.
+    /// * **A panicking handler loses only its own event.** The panic unwinds through `dispatch`; the events of the
+    ///   pass that were not delivered yet go back to the front of the queue, in order, and the next call delivers
+    ///   them.
+    pub fn dispatch(&self) -> usize {
+        let Some(mut pass) = self.inner.queue.begin_pass() else {
+            return 0;
+        };
+        let mut delivered = 0;
+        while let Some(item) = pass.pop() {
+            item(self);
+            delivered += 1;
+        }
+        delivered
+    }
+
+    /// How many events wait for the next [`dispatch`](EventBus::dispatch). The events of a pass that is running
+    /// are not counted.
+    pub fn pending(&self) -> usize {
+        self.inner.queue.pending()
+    }
+
+    /// Throws away the queued events without delivering them and returns how many there were.
+    pub fn clear_pending(&self) -> usize {
+        let discarded = self.inner.queue.take_all();
+        let count = discarded.len();
+        // Dropped here, outside the queue lock: an event's `Drop` may post to this bus.
+        drop(discarded);
+        count
+    }
+
+    /// A handle with which other threads post events to this bus; it does not keep the bus alive.
+    pub fn sender(&self) -> EventSender {
+        EventSender::new(Arc::downgrade(&self.inner))
+    }
+
     /// A handle that does not keep the bus alive; what a handler captures when it needs the bus.
     pub fn downgrade(&self) -> WeakEventBus {
         WeakEventBus {
@@ -524,6 +622,7 @@ impl fmt::Debug for EventBus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EventBus")
             .field("event_types", &self.inner.event_type_count())
+            .field("pending", &self.pending())
             .finish_non_exhaustive()
     }
 }

@@ -1,8 +1,8 @@
 # Events
 
 `engine/rust/crates/event` is the engine's event infrastructure. It is being built in milestones; this page describes
-what exists (E1, the synchronous bus, and E2, interceptors, cancellable events and one-shot handlers) and what is
-planned. The crate uses `std` only, has no dependencies and no `unsafe` code.
+what exists (E1, the synchronous bus; E2, interceptors, cancellable events and one-shot handlers; E3, queued
+events and a cross-thread sender) and what is planned. The crate uses `std` only, has no dependencies and no `unsafe` code.
 
 ## What is there
 
@@ -15,6 +15,8 @@ planned. The crate uses `std` only, has no dependencies and no `unsafe` code.
 | `Flow`          | What an interceptor answers: `Continue` (next handler) or `Stop` (end the chain).                                                                               |
 | `Dispatch`      | What `publish_mut` returns: `called()` (how many handlers ran) and `was_stopped()`.                                                                              |
 | `Cancellable<E>`| An event with a veto flag: `new`, `cancel`, `is_cancelled`, `into_inner`; dereferences to `E`.                                                                  |
+| `EventSender`   | The producer end of the queue: a cloneable, `Send + Sync` handle that posts events from any thread and does not keep the bus alive. `post`, `is_connected`.     |
+| `PostError<E>`  | What `EventSender::post` returns once the bus is gone; `into_inner()` gives the event back.                                                                      |
 
 | Method                                                    | Handler gets | Runs for                         | Notes                                                       |
 |:----------------------------------------------------------|:-------------|:---------------------------------|:------------------------------------------------------------|
@@ -24,6 +26,9 @@ planned. The crate uses `std` only, has no dependencies and no `unsafe` code.
 | `publish(&E) -> usize`                                    |              |                                  | Runs the observers; returns how many ran.                   |
 | `publish_mut(&mut E) -> Dispatch`                         |              |                                  | Runs the whole chain: observers and interceptors.           |
 | `subscriber_count::<E>()`, `downgrade()`                  |              |                                  | All kinds of handler count.                                 |
+| `post(E)` where `E: Send`                                 |              |                                  | Queues the event; nothing runs now.                         |
+| `dispatch() -> usize`                                     |              |                                  | Delivers the queued events in posting order; returns how many. |
+| `pending()`, `clear_pending()`, `sender()`                |              |                                  | Queue length, discard the queue, get an `EventSender`.      |
 
 ```rust,ignore
 use event::{Cancellable, EventBus, EventPriority, Flow};
@@ -63,12 +68,20 @@ assert!(attempt.is_cancelled());
 
 // A one-shot handler runs for the first event and is then unsubscribed.
 let _first = bus.subscribe_once(|_: &WindowResized| println!("first resize"));
+
+// Queued events: post now, deliver at a moment you choose (a frame boundary, say).
+let sender = bus.sender(); // give clones of this to worker threads
+std::thread::spawn(move || {
+    let _ = sender.post(WindowResized { width: 800, height: 600 });
+});
+// ... later, on the thread that owns the bus, once per frame:
+let delivered = bus.dispatch();
 ```
 
 ## Rules
 
 * **Synchronous.** `publish` and `publish_mut` run the handlers on the calling thread and return when the last one is
-  done. Nothing is queued yet.
+  done. `post` is the queued counterpart (see "Queued events").
 * **No lock is held while a handler runs.** A handler may publish (even the same event type; it recurses), subscribe,
   unsubscribe, and drop `Subscription`s, including the one of a handler that is being removed.
 * **A publish works on the handlers that existed when it began.** A handler subscribed during a publish is first
@@ -97,6 +110,32 @@ let _first = bus.subscribe_once(|_: &WindowResized| println!("first resize"));
   running at the same moment, and update it in place otherwise. A one-shot handler costs one extra lock round trip
   when it is claimed.
 
+## Queued events
+
+* **One queue per bus, in posting order.** `post` appends to a single queue shared by every event type, so delivery
+  order is posting order across types. Events posted by one thread keep that thread's order; between threads the
+  order is the order in which the posts took the queue's lock. Any thread can post, so the event must be `Send`.
+* **Delivery happens at `dispatch`.** The handlers that exist at that moment receive the event, not the ones that
+  existed when it was posted. A queued event is owned by the queue, so it is delivered like `publish_mut`: every
+  handler of its type runs (observers, interceptors, one-shot handlers) and `Flow::Stop` ends the chain; nobody is
+  left to read what interceptors change.
+* **One pass per call.** `dispatch` takes the events queued at that moment, delivers them, and returns how many. An
+  event posted while the pass runs (by a handler or another thread) waits for the next call, so a handler that
+  posts cannot keep one `dispatch` busy for ever; the next frame picks it up.
+* **One pass at a time.** If a pass is running already, on another thread or further up this thread's stack (a handler
+  that calls `dispatch`), the call returns 0 immediately. Events are never delivered concurrently or out of order.
+  The thread that owns the bus is meant to be the only one that calls `dispatch`.
+* **A panicking handler loses only its own event.** The panic unwinds through `dispatch`; the events of the pass that
+  were not delivered yet go back to the front of the queue in their original order, ahead of anything posted
+  meanwhile, and the next `dispatch` delivers them.
+* **`EventSender`.** `bus.sender()` returns a handle that holds the bus weakly: it does not keep the bus alive, and
+  once the bus is dropped `post` returns a `PostError` that carries the event back, which is how a worker thread
+  finds out that it should stop. Events still queued when the last bus handle is dropped are dropped with it.
+* **No lock is held while an event is delivered or dropped.** The queue lock covers a push, a batch take and a
+  re-queue only. A discarded or undelivered event's `Drop` may post to the bus.
+* **The queue is unbounded.** A producer faster than `dispatch` makes it grow. `pending()` shows the length; bounded
+  queues and diagnostics are part of E5.
+
 ## Why these choices
 
 * **`'static` types instead of an `Event` trait.** No derive or impl is needed to make something an event, and the
@@ -111,6 +150,12 @@ let _first = bus.subscribe_once(|_: &WindowResized| println!("first resize"));
   or published from `&self` code. Interceptors are the opt-in for events that are meant to be changed.
 * **`Cancellable` is a wrapper, not a bus feature.** The bus only knows `Flow`. What "cancelled" means differs
   between a physics step, a UI click and a file save, so the flag lives in the event and the publisher interprets it.
+* **One queue, one pass, one dispatcher.** A single ordered queue gives a defined delivery order and a simple
+  rule ("dispatch once per frame"). Per-type queues, priorities between events and parallel dispatch would each
+  need their own rules; parallel dispatch is E4's job and builds on this order.
+* **A weak `EventSender` instead of a channel type.** The thing worker threads need is a way to hand an event to
+  the thread that owns the bus; the bus's own queue is that channel. Wrapping `std::sync::mpsc` as well would give
+  two queues with two orderings.
 * **No one-shot interceptors.** `subscribe_once` is for observers. A one-shot veto is rare; it is a `subscribe_mut`
   handler that unsubscribes itself through its `Subscription`.
 
@@ -120,6 +165,6 @@ let _first = bus.subscribe_once(|_: &WindowResized| println!("first resize"));
 |:----------|:-------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | E1        | Synchronous typed bus, priorities, subscription handles, thread-safe, re-entrancy-safe. Done.                                                                            |
 | E2        | Interceptors (`subscribe_mut`, `publish_mut`, `Flow`, `Dispatch`), `Cancellable`, one-shot handlers (`subscribe_once`). Done (this page).                                |
-| E3        | Queued events: `post` now, `dispatch` at a chosen point (for example once per frame); a multi-producer channel for messages between threads.                            |
+| E3        | Queued events: `post`, `dispatch`, `pending`, `clear_pending`, and the cross-thread `EventSender`/`PostError`. Done (this page).                                        |
 | E4        | `threading` integration: dispatch a queue's handlers as jobs. Starts after the `threading` crate's task graphs (T4).                                                     |
 | E5        | Diagnostics (handler counts, slow-handler reporting through the logger), benchmarks, FFI exposure if the C++ side needs it.                                              |
