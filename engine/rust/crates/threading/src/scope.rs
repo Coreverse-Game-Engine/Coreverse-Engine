@@ -45,12 +45,13 @@ use std::mem;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
+use std::time::Duration;
 
 use crate::job::PanicPayload;
 use crate::pool::Shared;
 use crate::priority::JobPriority;
 use crate::queue::Task;
-use crate::sync::lock;
+use crate::sync::{IDLE_POLL, lock};
 
 /// What a scope remembers about its jobs.
 struct ScopeState {
@@ -89,6 +90,17 @@ impl ScopeState {
                 .wait(inner)
                 .unwrap_or_else(PoisonError::into_inner);
         }
+    }
+
+    /// Like [`block_until_idle`](Self::block_until_idle), but gives up after `timeout`; returns whether the
+    /// scope is idle.
+    fn block_until_idle_for(&self, timeout: Duration) -> bool {
+        let inner = lock(&self.inner);
+        let (inner, _) = self
+            .idle
+            .wait_timeout_while(inner, timeout, |inner| inner.pending > 0)
+            .unwrap_or_else(PoisonError::into_inner);
+        inner.pending == 0
     }
 
     /// Keeps the first panic; later ones are dropped (carefully: dropping a payload may itself panic).
@@ -342,6 +354,13 @@ fn wait_until_idle(shared: &Shared, state: &ScopeState) {
             continue;
         }
         // Nothing to run: the remaining jobs are running on other threads, and the last one to finish wakes us.
+        if shared.worker_count() == 0 {
+            // Without workers nobody runs what those jobs spawn next once their thread is gone: look again soon.
+            if state.block_until_idle_for(IDLE_POLL) {
+                return;
+            }
+            continue;
+        }
         state.block_until_idle();
         return;
     }

@@ -2,10 +2,10 @@
 
 `engine/rust/crates/threading` is the engine's job system. It is being built in milestones; this page describes what
 exists (T1 foundation, T2 queues/priorities/spawners, T3 scoped jobs and parallel loops, T4 dependencies and task
-graphs) and what is planned. The crate uses `std` only and has one `unsafe` block (see "Scoped jobs" below); everything
-added in T4 is safe code on top of it.
+graphs, T5 dedicated threads, roles and the IO pool) and what is planned. The crate uses `std` only and has one `unsafe` block (see "Scoped jobs" below); everything
+added in T4 and T5 is safe code on top of it.
 
-## What is there (T1 to T4)
+## What is there (T1 to T5)
 
 | Item                                | Purpose                                                                                                                                              |
 |:------------------------------------|:-----------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -16,7 +16,7 @@ added in T4 is safe code on top of it.
 | `join`                              | `pool.join(a, b)`: `a` on this thread, `b` as a job; both results back; both may borrow.                                                               |
 | `parallel_*`                        | `parallel_for(range, f)`, `parallel_chunks(range, chunk, f)`, `parallel_for_each(slice, f)`, `parallel_for_each_mut(slice, f)`, `parallel_chunks_mut(slice, chunk, f)`. |
 | `worker_index()`                    | The index of the calling thread among its pool's workers, or `None` on any other thread.                                                              |
-| `PoolConfig`, `WorkerCount`         | The settings: worker count (`Auto` or `Exact(n)`), thread name prefix, thread priority. Chained `with_*` setters, `validate()`.                       |
+| `PoolConfig`, `WorkerCount`         | The settings: worker count (`Auto` or `Exact(n)`), thread name prefix, thread priority, worker role. Chained `with_*` setters, `validate()`. `PoolConfig::io()` is the preset of an IO pool. |
 | `JobHandle<T>`                      | What `spawn` returns: `is_done()`, `wait()` (re-raises a panic), `wait_catch()` (returns the panic as a value).                                      |
 | `JobPanic`                          | A job's panic as a value: `message()`, `into_payload()`, `Display`, `Error`.                                                                          |
 | `JobHandle::then`                   | `handle.then(f)` / `then_with_priority(priority, f)`, `f` taking the job's result: queues a continuation when the job finishes; nobody waits. A panic skips it and travels on. |
@@ -24,7 +24,11 @@ added in T4 is safe code on top of it.
 | `TaskGraph`, `TaskId`               | A DAG of `FnMut` tasks. `add`, `add_after(name, &deps, f)`, `depend(task, after)` (refuses a cycle), `set_priority`, `name`, `dependencies`, `dependents`, `topological_order`. |
 | `run_graph`, `run_graph_catch`      | `pool.run_graph(&mut graph)` (also on `Spawner`): runs the graph with a counter per task; re-raises the first panic, or `run_graph_catch` returns a `GraphPanic`. |
 | `GraphPanic`                        | The failed task (`task()`, `task_name()`), its `panic()` and how many tasks were skipped because of it (`skipped_tasks()`).                          |
-| `ThreadingError`, `ThreadingResult` | `InvalidConfig`, `Spawn`, `PoolClosed`, `DependencyCycle { path }` and `UnknownTask`. `#[non_exhaustive]`, convertible into `ccore::CoreError`.         |
+| `JobHandle::then_on`                | `handle.then_on(&spawner, f)` (and `then_on_with_priority`): like `then`, but the continuation is queued on another pool; how a result moves from the IO pool to the compute pool. |
+| `ThreadRole`, `RoleGuard`           | Which job the calling thread has: `Unknown`, `Main`, `Worker`, `Io`, `Render`, `Audio`, `Custom(name)`. `ThreadRole::Main.enter()` marks a thread until the guard drops; `current()`, `is_current()`, `require()`, `assert_current()`, `debug_assert_current()`, `assert_not_current()`. |
+| `is_main_thread()`, `assert_main_thread()` | Shorthands for `ThreadRole::Main`.                                                                                                              |
+| `DedicatedThread<T>`, `ThreadConfig`, `StopToken` | A named thread with a role, a priority and a controlled lifetime: `spawn(config, \|stop\| ...)`, `request_stop`, `is_finished`, `join`, `join_catch`, `stop_and_join`, `detach`; dropping stops and joins. |
+| `ThreadingError`, `ThreadingResult` | `InvalidConfig`, `Spawn`, `ThreadSpawn`, `PoolClosed`, `WrongThread { expected, actual }`, `DependencyCycle { path }` and `UnknownTask`. `#[non_exhaustive]`, convertible into `ccore::CoreError`. |
 | `ThreadPriority`                    | Re-exported from `platform::thread`.                                                                                                                  |
 
 ```rust,ignore
@@ -194,7 +198,8 @@ assert_eq!(total.wait(), 100);
   handle itself (no job is queued for the join). When several jobs panicked, the panic of the first one in input order
   is reported after all of them finished; the other payloads are dropped. An empty group is done at once.
 * With no workers, a continuation waits in the queue like any job and runs when somebody waits or calls `run_pending`.
-  That mode is meant to be driven by one thread; several threads waiting on one worker-less pool is not supported.
+  A thread that waits on a pool without workers while another thread runs the job it needs looks at the queue again
+  every millisecond (see "Waiting on a pool without workers" below), so it finds what that thread queues.
 
 ### `TaskGraph`
 
@@ -232,6 +237,108 @@ pool.run_graph(&mut graph); // blocks until every task has run; run it again nex
 * **Why the checking is here and the conflict analysis is not.** The ECS scheduler will compute which systems conflict
   (who reads and writes which component) and turn that into edges; this crate only runs the resulting graph.
 
+## Dedicated threads, roles and the IO pool (T5)
+
+Three things that the pool of workers is not for: threads with a job of their own, a way for code to say which thread
+it may run on, and a pool for work that blocks. None of them adds `unsafe` code or a global.
+
+### Thread roles
+
+```rust,ignore
+// The runtime marks its main thread once, at the top of `main` (the guard restores the old role when dropped).
+let _main = ThreadRole::Main.enter();
+
+fn create_window() {
+    ThreadRole::Main.assert_current();   // panics, naming both roles, the thread and (track_caller) the call site
+    // ...
+}
+
+fn read_file_blocking(path: &Path) -> io::Result<Vec<u8>> {
+    ThreadRole::Main.assert_not_current();   // blocking calls stay off the main thread
+    ThreadRole::Render.assert_not_current();
+    std::fs::read(path)
+}
+```
+
+* A role is a label on a **thread**, kept in a thread-local; there is no process-wide "the main thread" variable. The
+  standard library cannot say which thread is the main one in a way an engine can rely on (the editor's GUI thread,
+  a test harness running every test on its own thread), so the code that owns the loop says so with `ThreadRole::Main
+  .enter()`, and every test thread can be a main thread in its own scope. Guards nest and are not `Send`.
+* Roles are set by the pools on their own workers (`Worker` by default, `Io` for the IO preset, anything with
+  `PoolConfig::with_role`), by `DedicatedThread` from its `ThreadConfig`, and by the runtime for the rest. A thread
+  nobody labelled is `Unknown`. `Custom("physics")` is for roles of the game itself; two custom roles are equal when
+  their names are.
+* Checking: `require()` returns `ThreadingError::WrongThread { expected, actual }` (convertible to `CoreError`);
+  `assert_current()` panics; `debug_assert_current()` only in builds with debug assertions; `assert_not_current()` is
+  the negative form for blocking calls.
+* **The role is the thread's, not the job's.** A thread that waits for a job and runs other jobs meanwhile keeps its
+  own role, and so does the thread that drives a pool without workers. `assert_current(Worker)` inside a job can
+  therefore fail when the job was run by a helping thread. Assertions about *where code must not run* (`assert_not_current`)
+  are the safe kind for jobs; assertions that code *is* on a worker only make sense in code that no waiting thread helps with.
+
+### Dedicated threads
+
+```rust,ignore
+let render = DedicatedThread::spawn(
+    ThreadConfig::new("cv-render").with_role(ThreadRole::Render).with_priority(ThreadPriority::High),
+    move |stop| {
+        while !stop.is_stopped() {
+            render_frame(&mut device);
+        }
+        device            // the closure's value comes back from join()
+    },
+)?;
+
+// ... later, at shutdown:
+let device = render.stop_and_join();
+```
+
+* `spawn` validates the config (non-empty name without NUL, stack size not 0), starts the thread, and the thread names
+  itself (`std::thread::Builder`), sets its role and asks for its priority (a request, as for workers) before it calls
+  the closure. Failure to start is `ThreadingError::ThreadSpawn { name, source }`.
+* **Lifetime.** The handle owns the thread. `request_stop()` only asks; the closure decides when to end by polling its
+  `StopToken` (`is_stopped()`, or `wait_timeout(d)` / `wait()` to sleep so that a stop wakes the thread at once instead of
+  after a nap). `join()` waits and returns the closure's value; `stop_and_join()` is both. **Dropping the handle stops
+  the thread and waits for it**, so a thread cannot outlive what started it by accident; that wait is as long as the
+  closure takes to notice the request. `detach()` gives up ownership and returns the token, the only way left to stop it.
+* A `StopToken` is a cloneable shared flag with a condition variable; `StopToken::new()` makes one that several threads
+  can share to be stopped by one call. `request_stop` is idempotent and never blocks.
+* **Panics.** A panic in the closure ends the thread, not the process. `join` re-raises it with the original payload,
+  `join_catch` returns a `JobPanic`; dropping the handle discards it. A thread cannot join itself (that panics; a
+  handle dropped on its own thread just lets it go).
+* A dedicated thread is not a worker: no queue, no stealing, no help while waiting. A render or audio thread that needs
+  work done in parallel owns a `Spawner` (or an `Arc<ThreadPool>`) and uses it like any thread outside the pool.
+
+### The IO pool
+
+`PoolConfig::io()` is the preset of a pool for blocking work: `DEFAULT_IO_WORKERS` (2) workers named `cv-io-<index>` with
+the role `Io`. It is an ordinary `ThreadPool`; what makes it the IO pool is that the runtime creates it next to the
+compute pool and gives it to the systems that block (`asset` and `vfs` will take its `Spawner`), so a read that waits
+for the disk can never occupy a worker that the frame needs. There is no hidden global IO pool, in line with the first
+design decision.
+
+To use the result of an IO job in compute code without a thread of either pool waiting for the other, move it with
+`then_on`:
+
+```rust,ignore
+let decoded = io.spawn(move || std::fs::read(path))          // blocking read on an IO worker
+    .then_on(&compute.spawner(), |bytes| decode(bytes?));   // decoding on a compute worker
+```
+
+The continuation is queued on the pool of the spawner, with `Normal` priority (`then_on_with_priority` chooses), and the
+returned handle belongs to that pool: a thread that waits for it helps *that* pool. Panics travel as with `then`. A
+thread that waits for an IO job helps the IO pool (it may run an IO job itself while it waits).
+
+### Waiting on a pool without workers
+
+A thread that waits normally sleeps when the queues are empty, because the job it needs must be running on another
+thread, and whatever that thread queues next (a continuation, a task whose dependencies just finished) will be run by a
+worker. A pool without workers has none, and the thread that queued the work may already be gone, so such a waiter
+(`JobHandle::wait`, and the wait at the end of a scope or a graph run) wakes every millisecond to look at the queues
+itself. This matters as soon as two threads share a worker-less pool, for example a test that drives a pool with
+`Exact(0)` from the main thread while a dedicated thread or an IO worker finishes a job whose continuation targets it
+(`then_on`). A single thread driving the pool never sleeps: it finds its jobs in the queue.
+
 ## Running Miri
 
 Miri checks the `unsafe` block in `scope.rs` (and everything else the tests execute) for undefined behaviour. It needs
@@ -244,12 +351,13 @@ cargo +nightly miri test -p threading --test pool
 cargo +nightly miri test -p threading --test scheduling
 cargo +nightly miri test -p threading --test scoped
 cargo +nightly miri test -p threading --test graph
+cargo +nightly miri test -p threading --test threads
 cargo +nightly miri test -p threading --doc
 ```
 
 * The tests scale their workload down under Miri (`scaled(normal, under_miri)` in each test file; the behaviour tested is
   the same, only the amount of work changes).
-* Two tests are ignored under Miri (`#[cfg_attr(miri, ignore)]`): the ones that ask the OS for a worker thread priority,
+* Three tests are ignored under Miri (`#[cfg_attr(miri, ignore)]`): the ones that ask the OS for a thread priority,
   because Miri cannot call `SetThreadPriority` and the like. That call is `platform`'s FFI, there is nothing for Miri to
   check in it.
 * `WorkerCount::Auto` does not call `platform::info::cpu_info()` (which also runs `GetLogicalProcessorInformationEx` on
@@ -268,7 +376,7 @@ cargo +nightly miri test -p threading --doc
 | T2        | Done: per-worker queues with stealing, three priorities (`High`/`Normal`/`Low`), `Spawner` for jobs that spawn jobs, `worker_index()`.              |
 | T3        | Done: `scope`, `join`, `parallel_for`, `parallel_chunks`, `parallel_for_each` (and `_mut` variants): jobs that borrow from the stack. The first `unsafe` module of the crate. |
 | T4        | Done: `JobHandle::then`, `when_all` (counter-based dependencies) and `TaskGraph` with cycle detection when it is built, run with a counter per task; for the ECS scheduler. |
-| T5        | Dedicated threads (render, audio), a separate IO pool for blocking work, a main-thread marker and `ThreadRole` assertions.                          |
+| T5        | Done: `DedicatedThread` with `ThreadConfig` and `StopToken`, `ThreadRole` with the main-thread marker and assertions, the `PoolConfig::io()` preset, `JobHandle::then_on` to move work between pools. |
 | T6        | Observer hooks for the profiler, per-worker statistics, per-worker scratch arenas on top of `memory`.                                               |
 | T7        | criterion benchmarks, the rest of the documentation, an optional Miri/loom job (the `scope` module is what it is for).                              |
 

@@ -4,12 +4,13 @@ use std::any::Any;
 use std::fmt;
 use std::mem;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::Duration;
 
-use crate::pool::Shared;
+use crate::pool::{Shared, Spawner};
 use crate::priority::JobPriority;
 use crate::queue::Task;
-use crate::sync::lock;
+use crate::sync::{IDLE_POLL, lock};
 
 /// The payload of a panic, as `catch_unwind` hands it out.
 pub(crate) type PanicPayload = Box<dyn Any + Send + 'static>;
@@ -109,6 +110,26 @@ impl<T> Slot<T> {
     }
 
     /// Blocks until the job is done and takes the result.
+    /// Like [`take_blocking`](Self::take_blocking), but gives up after `timeout` (`None`).
+    fn take_for(&self, timeout: Duration) -> Option<Result<T, PanicPayload>> {
+        let state = lock(&self.state);
+        let (mut state, _) = self
+            .ready
+            .wait_timeout_while(state, timeout, |state| {
+                matches!(*state, SlotState::Pending | SlotState::Continued(_))
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        if matches!(*state, SlotState::Pending | SlotState::Continued(_)) {
+            return None;
+        }
+        match mem::replace(&mut *state, SlotState::Taken) {
+            SlotState::Ready(result) => Some(result),
+            SlotState::Pending | SlotState::Continued(_) | SlotState::Taken => {
+                unreachable!("only a finished job gets here, and a handle is consumed by its wait")
+            }
+        }
+    }
+
     fn take_blocking(&self) -> Result<T, PanicPayload> {
         let mut state = lock(&self.state);
         while matches!(*state, SlotState::Pending | SlotState::Continued(_)) {
@@ -234,6 +255,13 @@ impl<T> JobHandle<T> {
             // Not done: run somebody's job instead of sleeping (see the type's documentation).
             if !self.shared.run_one() {
                 // The queue is empty, so the job is running on another thread and will wake us.
+                if self.shared.worker_count() == 0 {
+                    // No worker will run what that thread queues next (a continuation): look again soon.
+                    if let Some(result) = self.slot.take_for(IDLE_POLL) {
+                        return result.map_err(JobPanic::new);
+                    }
+                    continue;
+                }
                 return self.slot.take_blocking().map_err(JobPanic::new);
             }
         }
@@ -266,7 +294,9 @@ impl<T: Send + 'static> JobHandle<T> {
     ///
     /// With a pool without workers ([`WorkerCount::Exact(0)`](crate::WorkerCount::Exact)) the continuation
     /// is queued like any other job: it runs on the thread that waits for it or calls
-    /// [`run_pending`](crate::ThreadPool::run_pending).
+    /// [`run_pending`](crate::ThreadPool::run_pending). A thread that waits on such a pool while another thread
+    /// runs the job it needs looks at the queue again every millisecond, so it finds the continuation that
+    /// thread queues.
     pub fn then<F, U>(self, next: F) -> JobHandle<U>
     where
         F: FnOnce(T) -> U + Send + 'static,
@@ -281,9 +311,63 @@ impl<T: Send + 'static> JobHandle<T> {
         F: FnOnce(T) -> U + Send + 'static,
         U: Send + 'static,
     {
+        let target = Arc::clone(&self.shared);
+        self.then_in(target, priority, next)
+    }
+
+    /// Like [`then`](Self::then), but the continuation is queued on **another pool**, the one of `spawner`.
+    ///
+    /// This is how work moves between pools: read a file on the IO pool, then decode it on the compute pool,
+    /// without a thread of either pool waiting for the other.
+    ///
+    /// ```
+    /// use threading::{PoolConfig, ThreadPool, ThreadRole};
+    ///
+    /// let io = ThreadPool::new(PoolConfig::io())?;
+    /// let compute = ThreadPool::new(PoolConfig::new())?;
+    /// let decoded = io
+    ///     .spawn(|| vec![1_u8, 2, 3]) // "reads a file"
+    ///     .then_on(&compute.spawner(), |bytes| {
+    ///         assert_eq!(ThreadRole::current(), ThreadRole::Worker);
+    ///         bytes.iter().map(|&b| u32::from(b)).sum::<u32>()
+    ///     });
+    /// assert_eq!(decoded.wait(), 6);
+    /// # Ok::<(), threading::ThreadingError>(())
+    /// ```
+    ///
+    /// The returned handle belongs to the target pool: a thread that waits for it helps that pool. If the
+    /// target pool is shutting down and the finishing thread is not one of its jobs, the continuation runs on
+    /// that thread instead of being dropped, as for [`then`](Self::then).
+    pub fn then_on<F, U>(self, spawner: &Spawner, next: F) -> JobHandle<U>
+    where
+        F: FnOnce(T) -> U + Send + 'static,
+        U: Send + 'static,
+    {
+        self.then_on_with_priority(spawner, JobPriority::Normal, next)
+    }
+
+    /// Like [`then_on`](Self::then_on), with the priority of the continuation on the target pool.
+    pub fn then_on_with_priority<F, U>(
+        self,
+        spawner: &Spawner,
+        priority: JobPriority,
+        next: F,
+    ) -> JobHandle<U>
+    where
+        F: FnOnce(T) -> U + Send + 'static,
+        U: Send + 'static,
+    {
+        self.then_in(Arc::clone(&spawner.shared), priority, next)
+    }
+
+    /// The common part of the `then` family: queues the continuation on `target`.
+    fn then_in<F, U>(self, target: Arc<Shared>, priority: JobPriority, next: F) -> JobHandle<U>
+    where
+        F: FnOnce(T) -> U + Send + 'static,
+        U: Send + 'static,
+    {
         let output = Arc::new(Slot::new());
-        let handle = JobHandle::new(Arc::clone(&output), Arc::clone(&self.shared));
-        let shared = Arc::clone(&self.shared);
+        let handle = JobHandle::new(Arc::clone(&output), Arc::clone(&target));
         self.slot.on_complete(Box::new(move |result| match result {
             Err(payload) => output.complete(Err(payload)),
             Ok(value) => {
@@ -291,7 +375,7 @@ impl<T: Send + 'static> JobHandle<T> {
                     let result = panic::catch_unwind(AssertUnwindSafe(move || next(value)));
                     output.complete(result);
                 });
-                shared.submit_or_run(priority, task);
+                target.submit_or_run(priority, task);
             }
         }));
         handle

@@ -2,6 +2,8 @@
 
 use ccore::CoreError;
 
+use crate::role::ThreadRole;
+
 /// Everything that can go wrong when a thread pool is configured or started.
 ///
 /// Running jobs never fails with this type: a job that panics reports the panic through its
@@ -36,6 +38,25 @@ pub enum ThreadingError {
     #[error("the thread pool has shut down")]
     PoolClosed,
 
+    /// The operating system refused to start a [dedicated thread](crate::DedicatedThread).
+    #[error("could not start thread \"{name}\": {source}")]
+    ThreadSpawn {
+        /// The name the thread would have had.
+        name: String,
+        /// The error the OS reported.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Code that is restricted to one kind of thread ran on another; see [`ThreadRole::require`].
+    #[error("this must run on the {expected} thread, but the calling thread is {actual}")]
+    WrongThread {
+        /// The role the code needs.
+        expected: ThreadRole,
+        /// The role the calling thread has.
+        actual: ThreadRole,
+    },
+
     /// A dependency would make a [`TaskGraph`](crate::TaskGraph) cyclic, so its tasks could never all run.
     /// The graph is left as it was.
     #[error("the dependency would create a cycle: {}", .path.join(" -> "))]
@@ -59,7 +80,10 @@ impl From<ThreadingError> for CoreError {
         let message = err.to_string();
         match err {
             ThreadingError::InvalidConfig { .. } => CoreError::InvalidArgument(message),
-            ThreadingError::Spawn { .. } => CoreError::Io(message),
+            ThreadingError::Spawn { .. } | ThreadingError::ThreadSpawn { .. } => {
+                CoreError::Io(message)
+            }
+            ThreadingError::WrongThread { .. } => CoreError::InvalidState(message),
             ThreadingError::PoolClosed => CoreError::InvalidState(message),
             ThreadingError::DependencyCycle { .. } | ThreadingError::UnknownTask => {
                 CoreError::InvalidArgument(message)
@@ -117,6 +141,39 @@ mod tests {
         assert!(matches!(cycle, CoreError::InvalidArgument(_)));
         let unknown: CoreError = ThreadingError::UnknownTask.into();
         assert!(matches!(unknown, CoreError::InvalidArgument(_)));
+        let wrong: CoreError = ThreadingError::WrongThread {
+            expected: ThreadRole::Main,
+            actual: ThreadRole::Worker,
+        }
+        .into();
+        assert!(matches!(wrong, CoreError::InvalidState(_)));
+        let spawn: CoreError = ThreadingError::ThreadSpawn {
+            name: "cv-x".to_owned(),
+            source: std::io::Error::other("no threads left"),
+        }
+        .into();
+        assert!(matches!(spawn, CoreError::Io(_)));
+    }
+
+    #[test]
+    fn the_thread_errors_print_the_names_and_roles() {
+        let wrong = ThreadingError::WrongThread {
+            expected: ThreadRole::Main,
+            actual: ThreadRole::Io,
+        };
+        assert_eq!(
+            wrong.to_string(),
+            "this must run on the main thread, but the calling thread is io"
+        );
+        let spawn = ThreadingError::ThreadSpawn {
+            name: "cv-render".to_owned(),
+            source: std::io::Error::other("no threads left"),
+        };
+        let text = spawn.to_string();
+        assert!(
+            text.contains("cv-render") && text.contains("no threads left"),
+            "{text}"
+        );
     }
 
     #[test]

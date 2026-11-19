@@ -3,6 +3,7 @@
 use platform::thread::ThreadPriority;
 
 use crate::error::{ThreadingError, ThreadingResult};
+use crate::role::ThreadRole;
 
 /// The largest number of workers a pool accepts. A guard against a typo (or an overflowed computation) asking
 /// the OS for a hundred thousand threads; no machine has a use for more.
@@ -11,6 +12,14 @@ pub const MAX_WORKERS: usize = 1024;
 /// The worker thread name prefix of a default [`PoolConfig`]. Workers are named `<prefix>-<index>`, for
 /// example `cv-worker-0`.
 pub const DEFAULT_NAME_PREFIX: &str = "cv-worker";
+
+/// The worker thread name prefix of [`PoolConfig::io`]: `cv-io-0`, `cv-io-1`.
+pub const IO_NAME_PREFIX: &str = "cv-io";
+
+/// How many workers [`PoolConfig::io`] starts. Two is enough for the blocking calls of a game (reading assets,
+/// writing saves) to overlap without starting a thread per file; raise it with
+/// [`with_workers`](PoolConfig::with_workers) for a tool that reads from slow storage in bulk.
+pub const DEFAULT_IO_WORKERS: usize = 2;
 
 /// How many worker threads a pool starts.
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
@@ -68,17 +77,46 @@ pub struct PoolConfig {
     workers: WorkerCount,
     name_prefix: String,
     thread_priority: ThreadPriority,
+    role: ThreadRole,
 }
 
 impl PoolConfig {
-    /// The defaults: [`WorkerCount::Auto`], the prefix [`DEFAULT_NAME_PREFIX`] and normal thread priority.
+    /// The defaults: [`WorkerCount::Auto`], the prefix [`DEFAULT_NAME_PREFIX`], normal thread priority and the
+    /// role [`ThreadRole::Worker`].
     #[must_use]
     pub fn new() -> Self {
         Self {
             workers: WorkerCount::Auto,
             name_prefix: DEFAULT_NAME_PREFIX.to_owned(),
             thread_priority: ThreadPriority::Normal,
+            role: ThreadRole::Worker,
         }
+    }
+
+    /// The preset of an **IO pool**: [`DEFAULT_IO_WORKERS`] workers named `cv-io-<index>` with the role
+    /// [`ThreadRole::Io`].
+    ///
+    /// Blocking work (reading a file, waiting for a socket) belongs on a pool of its own, so that it cannot
+    /// occupy the workers that the frame's computation needs. There is no hidden global IO pool: the runtime
+    /// creates this one next to the compute pool and hands out a [`Spawner`](crate::Spawner) of it, which is
+    /// what `asset` and `vfs` will take. The pool is an ordinary [`ThreadPool`](crate::ThreadPool), so
+    /// priorities, handles, scopes and [`JobHandle::then_on`](crate::JobHandle::then_on) all work on it.
+    ///
+    /// ```
+    /// use threading::{PoolConfig, ThreadPool, ThreadRole};
+    ///
+    /// let io = ThreadPool::new(PoolConfig::io())?;
+    /// assert_eq!(io.worker_count(), 2);
+    /// let role = io.spawn(ThreadRole::current).wait();
+    /// assert_eq!(role, ThreadRole::Io);
+    /// # Ok::<(), threading::ThreadingError>(())
+    /// ```
+    #[must_use]
+    pub fn io() -> Self {
+        Self::new()
+            .with_workers(WorkerCount::Exact(DEFAULT_IO_WORKERS))
+            .with_name_prefix(IO_NAME_PREFIX)
+            .with_role(ThreadRole::Io)
     }
 
     /// Sets how many workers the pool starts.
@@ -106,6 +144,14 @@ impl PoolConfig {
         self
     }
 
+    /// Sets the [role](ThreadRole) every worker gets (default [`ThreadRole::Worker`]). It is what
+    /// [`ThreadRole::current`] answers on the pool's own threads.
+    #[must_use]
+    pub fn with_role(mut self, role: ThreadRole) -> Self {
+        self.role = role;
+        self
+    }
+
     /// The configured worker count (not yet resolved; see [`WorkerCount::resolve`]).
     #[must_use]
     pub fn workers(&self) -> WorkerCount {
@@ -122,6 +168,12 @@ impl PoolConfig {
     #[must_use]
     pub fn thread_priority(&self) -> ThreadPriority {
         self.thread_priority
+    }
+
+    /// The role the workers get.
+    #[must_use]
+    pub fn role(&self) -> ThreadRole {
+        self.role
     }
 
     /// Checks the settings without starting anything.
@@ -163,7 +215,19 @@ mod tests {
         assert_eq!(config.workers(), WorkerCount::Auto);
         assert_eq!(config.name_prefix(), DEFAULT_NAME_PREFIX);
         assert_eq!(config.thread_priority(), ThreadPriority::Normal);
+        assert_eq!(config.role(), ThreadRole::Worker);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn the_io_preset_has_two_named_io_workers() {
+        let config = PoolConfig::io();
+        assert_eq!(config.workers(), WorkerCount::Exact(DEFAULT_IO_WORKERS));
+        assert_eq!(config.name_prefix(), IO_NAME_PREFIX);
+        assert_eq!(config.role(), ThreadRole::Io);
+        assert!(config.validate().is_ok());
+        let more = PoolConfig::io().with_workers(WorkerCount::Exact(6));
+        assert_eq!(more.role(), ThreadRole::Io, "other setters keep the preset");
     }
 
     #[test]
@@ -171,7 +235,9 @@ mod tests {
         let config = PoolConfig::new()
             .with_workers(WorkerCount::Exact(2))
             .with_name_prefix("x")
-            .with_thread_priority(ThreadPriority::Low);
+            .with_thread_priority(ThreadPriority::Low)
+            .with_role(ThreadRole::Custom("physics"));
+        assert_eq!(config.role(), ThreadRole::Custom("physics"));
         assert_eq!(config.workers(), WorkerCount::Exact(2));
         assert_eq!(config.name_prefix(), "x");
         assert_eq!(config.thread_priority(), ThreadPriority::Low);

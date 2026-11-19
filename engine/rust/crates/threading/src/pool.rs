@@ -13,6 +13,7 @@ use crate::error::{ThreadingError, ThreadingResult};
 use crate::job::{JobHandle, Slot, join_all};
 use crate::priority::JobPriority;
 use crate::queue::{Queues, Task};
+use crate::role::{self, ThreadRole};
 use crate::sleep::Sleep;
 use crate::worker;
 
@@ -176,6 +177,7 @@ pub struct ThreadPool {
     workers: Vec<JoinHandle<()>>,
     worker_count: usize,
     name_prefix: String,
+    role: ThreadRole,
 }
 
 impl ThreadPool {
@@ -196,9 +198,10 @@ impl ThreadPool {
             let name = format!("{}-{index}", config.name_prefix());
             let worker_shared = Arc::clone(&shared);
             let priority = config.thread_priority();
+            let role = config.role();
             let started = thread::Builder::new()
                 .name(name.clone())
-                .spawn(move || worker_main(&worker_shared, index, priority));
+                .spawn(move || worker_main(&worker_shared, index, priority, role));
             match started {
                 Ok(handle) => workers.push(handle),
                 Err(source) => {
@@ -217,7 +220,14 @@ impl ThreadPool {
             workers,
             worker_count,
             name_prefix: config.name_prefix().to_owned(),
+            role: config.role(),
         })
+    }
+
+    /// The role the pool's workers have (see [`PoolConfig::with_role`]).
+    #[must_use]
+    pub fn role(&self) -> ThreadRole {
+        self.role
     }
 
     /// The number of worker threads (0 for a pool in single-threaded mode).
@@ -414,13 +424,14 @@ impl fmt::Debug for Spawner {
 }
 
 /// The body of a worker thread.
-fn worker_main(shared: &Shared, index: usize, priority: ThreadPriority) {
+fn worker_main(shared: &Shared, index: usize, priority: ThreadPriority, role: ThreadRole) {
     if priority != ThreadPriority::Normal {
         // A request: when the OS refuses (Linux without the privilege to raise a priority), the worker keeps
         // the default priority and does its work all the same.
         let _ = platform::thread::set_priority(priority);
     }
     worker::enter(shared.id, index);
+    role::set_current(role);
 
     // Jobs catch their own panics (see `Shared::spawn_job`), so this loop never unwinds.
     loop {
