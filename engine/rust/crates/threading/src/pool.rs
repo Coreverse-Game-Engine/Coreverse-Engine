@@ -3,17 +3,25 @@
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
+
+use memory::FrameArena;
 
 use platform::thread::ThreadPriority;
 
 use crate::config::PoolConfig;
 use crate::error::{ThreadingError, ThreadingResult};
-use crate::job::{JobHandle, Slot, join_all};
+use crate::job::{JobHandle, Slot, discard_payload, join_all};
+use crate::observe::{
+    Counters, JobFinish, JobObserver, JobStart, JobSteal, PoolId, PoolStats, WorkerSleep,
+    WorkerWake, nanos,
+};
 use crate::priority::JobPriority;
-use crate::queue::{Queues, Task};
+use crate::queue::{Origin, Queues, Task};
 use crate::role::{self, ThreadRole};
+use crate::scratch;
 use crate::sleep::Sleep;
 use crate::worker;
 
@@ -29,16 +37,67 @@ pub(crate) struct Shared {
     sleep: Sleep,
     /// Set once, when the pool is dropped: the workers finish the queues and leave.
     shutting_down: AtomicBool,
+    /// Receives the events of the pool, if the config installed one.
+    observer: Option<Arc<dyn JobObserver>>,
+    /// Whether to read the clock around jobs and sleeps: on when an observer is installed or the config asks.
+    timing: bool,
+    /// Numbers the jobs for the observer, in the order they start.
+    next_job: AtomicU64,
+    /// What each worker did, by worker index.
+    counters: Vec<Counters>,
+    /// What all the threads that are not workers of this pool did for it.
+    helpers: Counters,
+    /// The size of each worker's scratch arena in bytes; 0 when there is none.
+    scratch_capacity: usize,
+    /// Raised by [`ThreadPool::begin_scratch_frame`]; every worker resets its arena when it sees a new value.
+    scratch_epoch: AtomicU64,
 }
 
 impl Shared {
-    fn new(workers: usize) -> Self {
+    fn new(workers: usize, config: &PoolConfig) -> Self {
+        let observer = config.observer().cloned();
         Self {
             id: NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed),
             worker_count: workers,
             queues: Queues::new(workers),
             sleep: Sleep::new(),
             shutting_down: AtomicBool::new(false),
+            timing: config.timing() || observer.is_some(),
+            observer,
+            next_job: AtomicU64::new(0),
+            counters: (0..workers).map(|_| Counters::default()).collect(),
+            helpers: Counters::default(),
+            scratch_capacity: config.scratch_capacity().unwrap_or(0),
+            scratch_epoch: AtomicU64::new(0),
+        }
+    }
+
+    fn pool_id(&self) -> PoolId {
+        PoolId(self.id)
+    }
+
+    /// The counters of worker `index`, or the helpers' for a thread that is not a worker of this pool.
+    fn counters_of(&self, worker: Option<usize>) -> &Counters {
+        worker
+            .and_then(|index| self.counters.get(index))
+            .unwrap_or(&self.helpers)
+    }
+
+    /// Calls a hook of the observer, if there is one. A hook that panics must not take a worker down: the
+    /// panic is caught and dropped.
+    fn notify(&self, hook: impl FnOnce(&dyn JobObserver)) {
+        if let Some(observer) = &self.observer
+            && let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| hook(observer.as_ref())))
+        {
+            discard_payload(payload);
+        }
+    }
+
+    fn stats(&self) -> PoolStats {
+        PoolStats {
+            workers: self.counters.iter().map(Counters::snapshot).collect(),
+            helpers: self.helpers.snapshot(),
+            scratch_capacity: self.scratch_capacity,
         }
     }
 
@@ -105,7 +164,7 @@ impl Shared {
     /// tasks), the same fallback a scoped job uses.
     pub(crate) fn submit_or_run(&self, priority: JobPriority, task: Task) {
         if let Err(task) = self.submit(priority, task) {
-            self.run_task(task);
+            self.run_task(task, priority, Origin::Inline);
         }
     }
 
@@ -120,20 +179,128 @@ impl Shared {
     }
 
     /// Runs one task on the calling thread, which counts as running one of this pool's jobs meanwhile (see
-    /// [`submit`](Self::submit)).
-    fn run_task(&self, task: Task) {
-        let _running = worker::enter_job(self.id);
-        task();
+    /// [`submit`](Self::submit)), and keeps the statistics and the observer informed.
+    fn run_task(&self, task: Task, priority: JobPriority, origin: Origin) {
+        let worker = worker::index_in(self.id);
+        let counters = self.counters_of(worker);
+        counters.jobs.fetch_add(1, Ordering::Relaxed);
+        if let Origin::Stolen { victim } = origin {
+            counters.steals.fetch_add(1, Ordering::Relaxed);
+            if let Some(victim_counters) = self.counters.get(victim) {
+                victim_counters.stolen_from.fetch_add(1, Ordering::Relaxed);
+            }
+            self.notify(|observer| {
+                observer.job_stolen(&JobSteal {
+                    pool: self.pool_id(),
+                    thief: worker,
+                    victim,
+                    priority,
+                });
+            });
+        }
+
+        if !self.timing {
+            let _running = worker::enter_job(self.id);
+            task();
+            return;
+        }
+
+        let job = self.next_job.fetch_add(1, Ordering::Relaxed);
+        // A job that runs inside another job (help while waiting) is inside the other one's span; only the
+        // outermost job adds to the busy time.
+        let outermost = worker::running_depth() == 0;
+        let started = Instant::now();
+        self.notify(|observer| {
+            observer.job_started(&JobStart {
+                pool: self.pool_id(),
+                job,
+                worker,
+                priority,
+                at: started,
+            });
+        });
+        {
+            let _running = worker::enter_job(self.id);
+            task();
+        }
+        let duration = started.elapsed();
+        if outermost {
+            counters
+                .busy_nanos
+                .fetch_add(nanos(duration), Ordering::Relaxed);
+        }
+        self.notify(|observer| {
+            observer.job_finished(&JobFinish {
+                pool: self.pool_id(),
+                job,
+                worker,
+                priority,
+                started,
+                duration,
+            });
+        });
     }
 
     /// Runs one queued job on the calling thread. `false` when nothing was queued.
     pub(crate) fn run_one(&self) -> bool {
         match self.queues.pop(worker::index_in(self.id)) {
-            Some(task) => {
-                self.run_task(task);
+            Some(popped) => {
+                self.run_task(popped.task, popped.priority, popped.origin);
                 true
             }
             None => false,
+        }
+    }
+
+    /// Resets the scratch arena of the calling worker if a new frame has been announced since it last looked.
+    fn refresh_scratch(&self, index: usize, seen_epoch: &mut u64) {
+        let epoch = self.scratch_epoch.load(Ordering::Acquire);
+        if epoch == *seen_epoch {
+            return;
+        }
+        *seen_epoch = epoch;
+        if let Some(used) = scratch::begin_frame() {
+            let counters = &self.counters[index];
+            counters.scratch_frames.fetch_add(1, Ordering::Relaxed);
+            counters
+                .scratch_peak
+                .fetch_max(u64::try_from(used).unwrap_or(u64::MAX), Ordering::Relaxed);
+        }
+    }
+
+    /// A worker that found nothing to do sleeps until there is something again.
+    fn idle(&self, index: usize) {
+        let started = self.timing.then(Instant::now);
+        if let Some(at) = started {
+            self.notify(|observer| {
+                observer.worker_sleeping(&WorkerSleep {
+                    pool: self.pool_id(),
+                    worker: index,
+                    at,
+                });
+            });
+        }
+        let slept = self
+            .sleep
+            .wait_unless(|| self.queues.queued() > 0 || self.shutting_down.load(Ordering::SeqCst));
+        let counters = &self.counters[index];
+        if slept {
+            counters.sleeps.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(at) = started {
+            let duration = at.elapsed();
+            if slept {
+                counters
+                    .slept_nanos
+                    .fetch_add(nanos(duration), Ordering::Relaxed);
+            }
+            self.notify(|observer| {
+                observer.worker_woke(&WorkerWake {
+                    pool: self.pool_id(),
+                    worker: index,
+                    slept: duration,
+                });
+            });
         }
     }
 }
@@ -191,17 +358,31 @@ impl ThreadPool {
     pub fn new(config: PoolConfig) -> ThreadingResult<Self> {
         config.validate()?;
         let worker_count = config.workers().resolve();
-        let shared = Arc::new(Shared::new(worker_count));
+
+        // The scratch arenas are made here, so that a failure to allocate one is an error of `new`, before any
+        // thread exists; each is then moved into its worker.
+        let mut arenas: Vec<Option<FrameArena>> = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            arenas.push(match config.scratch_capacity() {
+                Some(capacity) => Some(
+                    FrameArena::with_capacity_tagged(capacity, config.scratch_tag())
+                        .map_err(ThreadingError::Scratch)?,
+                ),
+                None => None,
+            });
+        }
+
+        let shared = Arc::new(Shared::new(worker_count, &config));
         let mut workers = Vec::with_capacity(worker_count);
 
-        for index in 0..worker_count {
+        for (index, arena) in arenas.into_iter().enumerate() {
             let name = format!("{}-{index}", config.name_prefix());
             let worker_shared = Arc::clone(&shared);
             let priority = config.thread_priority();
             let role = config.role();
             let started = thread::Builder::new()
                 .name(name.clone())
-                .spawn(move || worker_main(&worker_shared, index, priority, role));
+                .spawn(move || worker_main(&worker_shared, index, priority, role, arena));
             match started {
                 Ok(handle) => workers.push(handle),
                 Err(source) => {
@@ -228,6 +409,34 @@ impl ThreadPool {
     #[must_use]
     pub fn role(&self) -> ThreadRole {
         self.role
+    }
+
+    /// The id of this pool, which the events of a [`JobObserver`] carry.
+    #[must_use]
+    pub fn id(&self) -> PoolId {
+        self.shared.pool_id()
+    }
+
+    /// A snapshot of what the workers (and the threads that helped) did so far; see [`PoolStats`].
+    #[must_use]
+    pub fn stats(&self) -> PoolStats {
+        self.shared.stats()
+    }
+
+    /// Announces a new frame to the scratch arenas of the workers (see [`PoolConfig::with_scratch`]): each
+    /// worker frees its arena the next time it is between jobs, and not while a job still borrows it with
+    /// [`with_scratch`](crate::with_scratch). It does nothing in a pool without scratch memory.
+    ///
+    /// Call it once per frame, from the thread that runs the frame loop, after the frame's jobs are done (or
+    /// at the start of the next frame, before spawning). It does not wait and takes no lock: it raises a
+    /// counter and wakes the sleeping workers so that they can reset at once. Calling it more often than
+    /// workers get between jobs merges the announcements into one reset.
+    pub fn begin_scratch_frame(&self) {
+        if self.shared.scratch_capacity == 0 {
+            return;
+        }
+        self.shared.scratch_epoch.fetch_add(1, Ordering::Release);
+        self.shared.sleep.wake_all();
     }
 
     /// The number of worker threads (0 for a pool in single-threaded mode).
@@ -413,6 +622,18 @@ impl Spawner {
     {
         join_all(&self.shared, handles.into_iter().collect())
     }
+
+    /// The id of the pool (see [`ThreadPool::id`]).
+    #[must_use]
+    pub fn id(&self) -> PoolId {
+        self.shared.pool_id()
+    }
+
+    /// A snapshot of the statistics of the pool (see [`ThreadPool::stats`]).
+    #[must_use]
+    pub fn stats(&self) -> PoolStats {
+        self.shared.stats()
+    }
 }
 
 impl fmt::Debug for Spawner {
@@ -424,7 +645,13 @@ impl fmt::Debug for Spawner {
 }
 
 /// The body of a worker thread.
-fn worker_main(shared: &Shared, index: usize, priority: ThreadPriority, role: ThreadRole) {
+fn worker_main(
+    shared: &Shared,
+    index: usize,
+    priority: ThreadPriority,
+    role: ThreadRole,
+    arena: Option<FrameArena>,
+) {
     if priority != ThreadPriority::Normal {
         // A request: when the OS refuses (Linux without the privilege to raise a priority), the worker keeps
         // the default priority and does its work all the same.
@@ -432,11 +659,18 @@ fn worker_main(shared: &Shared, index: usize, priority: ThreadPriority, role: Th
     }
     worker::enter(shared.id, index);
     role::set_current(role);
+    if let Some(arena) = arena {
+        scratch::install(arena);
+    }
+    // Frames announced before this worker existed are not its business.
+    let mut seen_epoch = shared.scratch_epoch.load(Ordering::Acquire);
 
     // Jobs catch their own panics (see `Shared::spawn_job`), so this loop never unwinds.
     loop {
-        if let Some(task) = shared.queues.pop(Some(index)) {
-            shared.run_task(task);
+        // Between jobs: nothing on this thread borrows the arena, so it may be reset.
+        shared.refresh_scratch(index, &mut seen_epoch);
+        if let Some(popped) = shared.queues.pop(Some(index)) {
+            shared.run_task(popped.task, popped.priority, popped.origin);
             continue;
         }
         if shared.queues.queued() > 0 {
@@ -445,11 +679,10 @@ fn worker_main(shared: &Shared, index: usize, priority: ThreadPriority, role: Th
             continue;
         }
         if shared.shutting_down.load(Ordering::SeqCst) {
+            scratch::uninstall();
             return;
         }
-        shared.sleep.wait_unless(|| {
-            shared.queues.queued() > 0 || shared.shutting_down.load(Ordering::SeqCst)
-        });
+        shared.idle(index);
     }
 }
 

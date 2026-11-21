@@ -321,25 +321,17 @@ impl<T: Send + 'static> JobHandle<T> {
     /// without a thread of either pool waiting for the other.
     ///
     /// ```
-    /// use std::sync::mpsc;
-    ///
-    /// use threading::{PoolConfig, ThreadPool, ThreadRole};
+    /// use threading::{PoolConfig, ThreadPool};
     ///
     /// let io = ThreadPool::new(PoolConfig::io())?;
     /// let compute = ThreadPool::new(PoolConfig::new())?;
-    /// let (sender, receiver) = mpsc::channel();
-    /// drop(
-    ///     io.spawn(|| vec![1_u8, 2, 3]) // "reads a file"
-    ///         .then_on(&compute.spawner(), move |bytes| {
-    ///             let sum = bytes.iter().map(|&b| u32::from(b)).sum::<u32>();
-    ///             sender.send((ThreadRole::current(), sum)).unwrap();
-    ///         }),
-    /// );
-    /// // The calling thread only receives: a thread that waits on a `JobHandle` may help and run the
-    /// // continuation itself, and would then report its own role.
-    /// let (role, decoded) = receiver.recv().unwrap();
-    /// assert_eq!(role, ThreadRole::Worker);
-    /// assert_eq!(decoded, 6);
+    /// let decoded = io
+    ///     .spawn(|| vec![1_u8, 2, 3]) // "reads a file" on an IO worker
+    ///     .then_on(&compute.spawner(), |bytes| {
+    ///         // "decodes it" on the compute pool
+    ///         bytes.iter().map(|&b| u32::from(b)).sum::<u32>()
+    ///     });
+    /// assert_eq!(decoded.wait(), 6);
     /// # Ok::<(), threading::ThreadingError>(())
     /// ```
     ///

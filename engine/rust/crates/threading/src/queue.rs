@@ -39,6 +39,26 @@ struct Injector {
     closed: bool,
 }
 
+/// Where a job that is about to run came from.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub(crate) enum Origin {
+    /// The queue of the thread that takes it.
+    Own,
+    /// The shared queue of jobs spawned from outside the pool.
+    Shared,
+    /// The queue of another worker.
+    Stolen { victim: usize },
+    /// Not from a queue: a task that runs on the thread that made it, because the pool refused it.
+    Inline,
+}
+
+/// A job taken from the queues, with what is known about it.
+pub(crate) struct Popped {
+    pub(crate) task: Task,
+    pub(crate) priority: JobPriority,
+    pub(crate) origin: Origin,
+}
+
 /// All queues of one pool.
 pub(crate) struct Queues {
     injector: Mutex<Injector>,
@@ -89,30 +109,34 @@ impl Queues {
 
     /// Takes the next job for the thread `me` (`Some(worker index)` for a worker of this pool, `None` for any
     /// other thread that helps), following the rules in the module documentation.
-    pub(crate) fn pop(&self, me: Option<usize>) -> Option<Task> {
+    pub(crate) fn pop(&self, me: Option<usize>) -> Option<Popped> {
         for lane in (0..LANES).rev() {
             if self.queued[lane].load(Ordering::SeqCst) == 0 {
                 continue;
             }
-            if let Some(task) = self.pop_lane(lane, me) {
+            if let Some((task, origin)) = self.pop_lane(lane, me) {
                 self.queued[lane].fetch_sub(1, Ordering::SeqCst);
-                return Some(task);
+                return Some(Popped {
+                    task,
+                    priority: JobPriority::ALL[lane],
+                    origin,
+                });
             }
         }
         None
     }
 
-    fn pop_lane(&self, lane: usize, me: Option<usize>) -> Option<Task> {
+    fn pop_lane(&self, lane: usize, me: Option<usize>) -> Option<(Task, Origin)> {
         if let Some(local) = me.and_then(|index| self.locals.get(index)) {
             let task = lock(local)[lane].pop_back();
-            if task.is_some() {
-                return task;
+            if let Some(task) = task {
+                return Some((task, Origin::Own));
             }
         }
 
         let task = lock(&self.injector).lanes[lane].pop_front();
-        if task.is_some() {
-            return task;
+        if let Some(task) = task {
+            return Some((task, Origin::Shared));
         }
 
         // Steal. Start next to our own index so that the workers do not all hit worker 0 first.
@@ -124,8 +148,8 @@ impl Queues {
                 continue;
             }
             let task = lock(&self.locals[victim])[lane].pop_front();
-            if task.is_some() {
-                return task;
+            if let Some(task) = task {
+                return Some((task, Origin::Stolen { victim }));
             }
         }
         None
@@ -163,8 +187,8 @@ mod tests {
 
     fn drain(queues: &Queues, me: Option<usize>) -> usize {
         let mut ran = 0;
-        while let Some(task) = queues.pop(me) {
-            task();
+        while let Some(popped) = queues.pop(me) {
+            (popped.task)();
             ran += 1;
         }
         ran
@@ -248,6 +272,42 @@ mod tests {
             .unwrap();
         assert_eq!(drain(&queues, None), 3);
         assert_eq!(*lock(&log), ["shared", "w0", "w1"]);
+    }
+
+    #[test]
+    fn a_popped_job_says_where_it_came_from_and_with_which_priority() {
+        let queues = Queues::new(2);
+        let noop = || -> Task { Box::new(|| ()) };
+
+        queues.push_local(0, JobPriority::Normal, noop());
+        assert!(queues.push_external(JobPriority::High, noop()).is_ok());
+        queues.push_local(1, JobPriority::Low, noop());
+
+        // Worker 0: the most urgent job first (the shared one), then its own, then a theft from worker 1.
+        let first = queues.pop(Some(0)).unwrap();
+        assert_eq!(
+            (first.origin, first.priority),
+            (Origin::Shared, JobPriority::High)
+        );
+        let second = queues.pop(Some(0)).unwrap();
+        assert_eq!(
+            (second.origin, second.priority),
+            (Origin::Own, JobPriority::Normal)
+        );
+        let third = queues.pop(Some(0)).unwrap();
+        assert_eq!(
+            (third.origin, third.priority),
+            (Origin::Stolen { victim: 1 }, JobPriority::Low)
+        );
+        assert!(queues.pop(Some(0)).is_none());
+    }
+
+    #[test]
+    fn a_helper_that_is_not_a_worker_steals_from_a_named_victim() {
+        let queues = Queues::new(2);
+        queues.push_local(1, JobPriority::Normal, Box::new(|| ()));
+        let popped = queues.pop(None).unwrap();
+        assert_eq!(popped.origin, Origin::Stolen { victim: 1 });
     }
 
     #[test]

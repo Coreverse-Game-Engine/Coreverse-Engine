@@ -34,11 +34,12 @@ impl Sleep {
     }
 
     /// Sleeps until woken, unless `must_stay_awake()` is already true. Spurious wake-ups happen; the caller
-    /// looks for work again either way.
-    pub(crate) fn wait_unless(&self, must_stay_awake: impl FnOnce() -> bool) {
+    /// looks for work again either way. Returns whether it really waited.
+    pub(crate) fn wait_unless(&self, must_stay_awake: impl FnOnce() -> bool) -> bool {
         let mut guard = lock(&self.lock);
         self.sleepers.fetch_add(1, Ordering::SeqCst);
-        if !must_stay_awake() {
+        let waited = !must_stay_awake();
+        if waited {
             guard = self
                 .wake
                 .wait(guard)
@@ -46,6 +47,7 @@ impl Sleep {
         }
         self.sleepers.fetch_sub(1, Ordering::SeqCst);
         drop(guard);
+        waited
     }
 
     /// Wakes one sleeper, if there is one.
@@ -76,7 +78,7 @@ mod tests {
     #[test]
     fn waiting_returns_at_once_when_the_caller_must_stay_awake() {
         let sleep = Sleep::new();
-        sleep.wait_unless(|| true);
+        assert!(!sleep.wait_unless(|| true), "it did not wait");
         assert_eq!(sleep.sleepers.load(Ordering::SeqCst), 0);
     }
 

@@ -2,10 +2,11 @@
 
 `engine/rust/crates/threading` is the engine's job system. It is being built in milestones; this page describes what
 exists (T1 foundation, T2 queues/priorities/spawners, T3 scoped jobs and parallel loops, T4 dependencies and task
-graphs, T5 dedicated threads, roles and the IO pool) and what is planned. The crate uses `std` only and has one `unsafe` block (see "Scoped jobs" below); everything
-added in T4 and T5 is safe code on top of it.
+graphs, T5 dedicated threads, roles and the IO pool, T6 observation and scratch memory) and what is planned. The crate uses `std` only and has one `unsafe` block (see "Scoped jobs" below); everything
+added in T4, T5 and T6 is safe code on top of it. The crate depends on `ccore`, `platform`, `memory` (T6: the scratch
+arenas) and `thiserror`.
 
-## What is there (T1 to T5)
+## What is there (T1 to T6)
 
 | Item                                | Purpose                                                                                                                                              |
 |:------------------------------------|:-----------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -28,7 +29,10 @@ added in T4 and T5 is safe code on top of it.
 | `ThreadRole`, `RoleGuard`           | Which job the calling thread has: `Unknown`, `Main`, `Worker`, `Io`, `Render`, `Audio`, `Custom(name)`. `ThreadRole::Main.enter()` marks a thread until the guard drops; `current()`, `is_current()`, `require()`, `assert_current()`, `debug_assert_current()`, `assert_not_current()`. |
 | `is_main_thread()`, `assert_main_thread()` | Shorthands for `ThreadRole::Main`.                                                                                                              |
 | `DedicatedThread<T>`, `ThreadConfig`, `StopToken` | A named thread with a role, a priority and a controlled lifetime: `spawn(config, \|stop\| ...)`, `request_stop`, `is_finished`, `join`, `join_catch`, `stop_and_join`, `detach`; dropping stops and joins. |
-| `ThreadingError`, `ThreadingResult` | `InvalidConfig`, `Spawn`, `ThreadSpawn`, `PoolClosed`, `WrongThread { expected, actual }`, `DependencyCycle { path }` and `UnknownTask`. `#[non_exhaustive]`, convertible into `ccore::CoreError`. |
+| `JobObserver` and its events           | Profiler hooks: `job_started`, `job_finished`, `job_stolen`, `worker_sleeping`, `worker_woke`, with `JobStart`, `JobFinish`, `JobSteal`, `WorkerSleep`, `WorkerWake` (non-exhaustive structs) and `PoolId`. Installed with `PoolConfig::with_observer`. |
+| `ThreadPool::stats()`, `PoolStats`, `WorkerStats` | Always-on counters per worker (and for the helping threads): jobs run, steals, stolen from, sleeps, busy and slept time (with `with_timing` or an observer), scratch frames and peak. |
+| `PoolConfig::with_scratch`, `with_scratch_tag`, `with_timing`, `with_observer`; `with_scratch(\|arena\| ...)`, `ThreadPool::begin_scratch_frame()` | A `FrameArena` per worker registered with a `MemoryTag`; jobs reach the arena of their thread; the frame loop announces a new frame. |
+| `ThreadingError`, `ThreadingResult` | `InvalidConfig`, `Spawn`, `ThreadSpawn`, `Scratch`, `PoolClosed`, `WrongThread { expected, actual }`, `DependencyCycle { path }` and `UnknownTask`. `#[non_exhaustive]`, convertible into `ccore::CoreError`. |
 | `ThreadPriority`                    | Re-exported from `platform::thread`.                                                                                                                  |
 
 ```rust,ignore
@@ -339,6 +343,100 @@ itself. This matters as soon as two threads share a worker-less pool, for exampl
 `Exact(0)` from the main thread while a dedicated thread or an IO worker finishes a job whose continuation targets it
 (`then_on`). A single thread driving the pool never sleeps: it finds its jobs in the queue.
 
+## Observation and scratch memory (T6)
+
+Two kinds of reader get two mechanisms: a profiler wants to be told *as things happen*, a debug overlay or a test wants
+*counters it can read*. Both are built into the scheduling code; neither needs `unsafe`, and the crate still has no
+dependency on `profiler`: the hooks are a trait on this side, and whoever owns the profiler implements it.
+
+### Observer hooks
+
+```rust,ignore
+struct Timeline { /* a lock-free ring buffer, say */ }
+
+impl JobObserver for Timeline {
+    fn job_started(&self, e: &JobStart)   { self.record(Kind::Begin, e.pool, e.worker, e.job, e.at); }
+    fn job_finished(&self, e: &JobFinish) { self.record(Kind::End,   e.pool, e.worker, e.job, e.started + e.duration); }
+    fn job_stolen(&self, e: &JobSteal)    { self.record_steal(e.thief, e.victim); }
+    fn worker_sleeping(&self, e: &WorkerSleep) { /* ... */ }
+    fn worker_woke(&self, e: &WorkerWake)      { /* e.slept */ }
+}
+
+let pool = ThreadPool::new(PoolConfig::new().with_observer(Arc::new(timeline)))?;
+```
+
+* Five hooks, all with an empty default, so an observer implements the ones it needs. The event structs are
+  `#[non_exhaustive]` plain data (`Copy`), so fields can be added later without breaking observers.
+* **Which thread.** Hooks run on the thread the event happens on, in the middle of the scheduler: a worker, or a helping
+  thread (a thread that waits for a job and runs jobs meanwhile; its events have `worker: None`). So they must be fast and
+  must not block, and must not spawn on, or wait for, the pool they observe: record into a buffer and return. **A hook
+  that panics is caught and dropped** (the event is lost, the worker survives).
+* **Order.** Per thread, `job_stolen` (if any) comes before `job_started`, `job_started` before the matching
+  `job_finished`, and a job run inside another job (help while waiting) is nested between the outer start and finish.
+  Between threads there is no order: sort by the timestamps. Job numbers (`job`) count in start order per pool.
+* `worker_sleeping` is always followed by `worker_woke` (with how long the sleep lasted); a worker that is kept awake by work
+  that arrives in the same instant gets a pair with a very short `slept`.
+* A job that panics is reported as finished like any other: its panic goes to its handle. The hooks do not say whether a
+  job panicked.
+* One observer can serve several pools (`PoolId` in every event; `ThreadPool::id()`, `Spawner::id()`).
+* Observers are installed when the pool is built. Installing one turns timing on, since events carry durations. Swapping an
+  observer on a running pool is not offered (it would put a lock on the path of every job); it can be added if a tool needs it.
+
+### Statistics
+
+`pool.stats()` returns a `PoolStats` snapshot: one `WorkerStats` per worker, one for `helpers` (everything threads that are not
+workers did for the pool: waiting threads, the thread that shuts the pool down, all the jobs of a pool without workers) and
+`total()`.
+
+| field | meaning |
+| --- | --- |
+| `jobs_run` | jobs run |
+| `steals` | jobs this thread took from another worker's queue |
+| `stolen_from` | jobs other threads took from this worker's queue |
+| `sleeps` | sleeps that have **ended** (a sleep in progress is not counted yet) |
+| `busy`, `slept` | time running jobs (nested jobs count once, with the outermost) and time asleep; **zero unless timing is on** (`with_timing(true)` or an observer) |
+| `scratch_frames`, `scratch_peak` | frames the worker's scratch arena has been through, and the most bytes it used in one |
+
+Counters only grow; read twice and subtract for a frame. They are relaxed atomics, each worker's on a cache line of its own, so
+a snapshot taken under load is not a consistent cut (a job may be counted as run and not yet as stolen) but is exact once
+the pool is idle. Without timing and without an observer a job costs a few relaxed additions; with either, two clock reads.
+
+### Scratch memory
+
+```rust,ignore
+let pool = ThreadPool::new(PoolConfig::new().with_scratch(256 * 1024).with_scratch_tag(MemoryTag::Ecs))?;
+
+// in a job:
+let sum = with_scratch(|arena| {
+    let tmp = arena.alloc_slice_fill(1024, 0.0_f32).unwrap();   // bump allocation, no malloc
+    fill(tmp);
+    tmp.iter().sum::<f32>()
+}).unwrap_or_else(|| heap_fallback());
+
+// once per frame, from the frame loop, after the frame's jobs are done:
+pool.begin_scratch_frame();
+```
+
+* `with_scratch(capacity)` gives every worker a `memory::FrameArena` of that many bytes, **allocated when the pool starts**
+  (an allocation failure is `ThreadingError::Scratch` from `ThreadPool::new`, before any thread exists) and registered with the
+  tag from `with_scratch_tag` (default `MemoryTag::General`), so memory reports show it and a budget can cover it. The arenas
+  are freed when the workers leave. (`MemoryTag` is the `memory` crate's; this crate adds no tag.)
+* `with_scratch(|arena| ...)` lends the arena of the calling thread for the closure and returns `None` on a thread that has none:
+  any thread that is not a worker of a pool with scratch, including a waiting thread that helps (it may run your job itself) and
+  every thread of a pool without workers. Code that can run there needs a fallback (the heap).
+* **Why it is safe, without `unsafe`:** nothing allocated in the closure can outlive it (the closure's result cannot borrow
+  the arena); the arena sits in a thread-local `Rc`, and `begin_frame` (which needs `&mut`) runs only when `Rc::get_mut` says
+  no closure holds it. Nested use (a job that runs a job inside itself, or `with_scratch` inside `with_scratch`) is fine: the
+  arena hands out disjoint pieces and nothing is reset until the outermost borrow ends.
+* **Frames.** `begin_scratch_frame()` takes no lock and does not wait: it raises a counter and wakes the sleeping workers. Each
+  worker resets its arena the next time it is between jobs; a job that is running keeps its memory until it is done. So the
+  guarantee is: *a job that starts after its worker has seen the announcement finds an empty arena*. Announce at the end of a
+  frame (after waiting for its jobs) or at the start of the next one, before spawning; the stats show how many resets
+  happened. Several announcements before a worker gets between jobs merge into one reset.
+* Not offered: a job-scoped arena that is reset after every job (the frame is what the plan asks for and what `memory` offers),
+  growing arenas (a full arena returns the `MemoryError` of `memory`, so size it for the frame's peak: `scratch_peak` tells
+  how much a frame used), and arenas for threads that are not workers.
+
 ## Running Miri
 
 Miri checks the `unsafe` block in `scope.rs` (and everything else the tests execute) for undefined behaviour. It needs
@@ -352,6 +450,8 @@ cargo +nightly miri test -p threading --test scheduling
 cargo +nightly miri test -p threading --test scoped
 cargo +nightly miri test -p threading --test graph
 cargo +nightly miri test -p threading --test threads
+cargo +nightly miri test -p threading --test observe
+cargo +nightly miri test -p threading --test scratch_tag
 cargo +nightly miri test -p threading --doc
 ```
 
@@ -377,7 +477,7 @@ cargo +nightly miri test -p threading --doc
 | T3        | Done: `scope`, `join`, `parallel_for`, `parallel_chunks`, `parallel_for_each` (and `_mut` variants): jobs that borrow from the stack. The first `unsafe` module of the crate. |
 | T4        | Done: `JobHandle::then`, `when_all` (counter-based dependencies) and `TaskGraph` with cycle detection when it is built, run with a counter per task; for the ECS scheduler. |
 | T5        | Done: `DedicatedThread` with `ThreadConfig` and `StopToken`, `ThreadRole` with the main-thread marker and assertions, the `PoolConfig::io()` preset, `JobHandle::then_on` to move work between pools. |
-| T6        | Observer hooks for the profiler, per-worker statistics, per-worker scratch arenas on top of `memory`.                                               |
+| T6        | Done: `JobObserver` hooks (`PoolConfig::with_observer`), `PoolStats` per worker, per-worker `FrameArena` scratch registered with a `MemoryTag` (`with_scratch`, `begin_scratch_frame`). |
 | T7        | criterion benchmarks, the rest of the documentation, an optional Miri/loom job (the `scope` module is what it is for).                              |
 
 Not planned for now: an `async` executor, fibers, `no_std`, an FFI for C++ (it comes when C++ needs to submit jobs,

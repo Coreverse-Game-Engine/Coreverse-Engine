@@ -38,6 +38,11 @@ pub enum ThreadingError {
     #[error("the thread pool has shut down")]
     PoolClosed,
 
+    /// The scratch memory of a worker could not be allocated (see
+    /// [`PoolConfig::with_scratch`](crate::PoolConfig::with_scratch)).
+    #[error("could not allocate the scratch memory of a worker: {0}")]
+    Scratch(#[source] memory::MemoryError),
+
     /// The operating system refused to start a [dedicated thread](crate::DedicatedThread).
     #[error("could not start thread \"{name}\": {source}")]
     ThreadSpawn {
@@ -84,6 +89,7 @@ impl From<ThreadingError> for CoreError {
                 CoreError::Io(message)
             }
             ThreadingError::WrongThread { .. } => CoreError::InvalidState(message),
+            ThreadingError::Scratch(_) => CoreError::Other(message),
             ThreadingError::PoolClosed => CoreError::InvalidState(message),
             ThreadingError::DependencyCycle { .. } | ThreadingError::UnknownTask => {
                 CoreError::InvalidArgument(message)
