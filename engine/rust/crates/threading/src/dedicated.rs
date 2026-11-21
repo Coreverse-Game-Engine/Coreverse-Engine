@@ -18,6 +18,7 @@ use platform::thread::ThreadPriority;
 use crate::error::{ThreadingError, ThreadingResult};
 use crate::job::{JobPanic, PanicPayload, discard_payload};
 use crate::role::{self, ThreadRole};
+use crate::sync::lock;
 
 /// The settings of a [`DedicatedThread`]. Built with the chained setters, like
 /// [`PoolConfig`](crate::PoolConfig).
@@ -184,22 +185,14 @@ impl StopToken {
     /// [`wait_timeout`](Self::wait_timeout). Idempotent, and it never blocks.
     pub fn request_stop(&self) {
         // Setting the flag under the lock closes the gap between a sleeper's check and its sleep.
-        let _guard = self
-            .state
-            .lock
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let _guard = lock(&self.state.lock);
         self.state.stopped.store(true, Ordering::Release);
         self.state.wake.notify_all();
     }
 
     /// Sleeps until a stop is requested.
     pub fn wait(&self) {
-        let guard = self
-            .state
-            .lock
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let guard = lock(&self.state.lock);
         let _guard = self
             .state
             .wake
@@ -212,11 +205,7 @@ impl StopToken {
     /// `thread::sleep`, so that stopping it never has to wait for a nap to end.
     #[must_use]
     pub fn wait_timeout(&self, timeout: Duration) -> bool {
-        let guard = self
-            .state
-            .lock
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let guard = lock(&self.state.lock);
         let (_guard, _timed_out) = self
             .state
             .wake

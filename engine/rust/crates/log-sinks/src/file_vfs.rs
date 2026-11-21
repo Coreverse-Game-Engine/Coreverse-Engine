@@ -3,7 +3,8 @@ use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::Mutex;
+use utilities::sync::lock;
 
 /// Abstraction over the `logs://` virtual filesystem. The engine's own VFS
 /// crate can implement this directly against its dual-backend (loose files
@@ -138,13 +139,6 @@ pub fn default_route(diagnostic: &Diagnostic) -> &'static str {
         // external-analysis diagnostic from the engine's point of view.
         "compiler.log"
     }
-}
-
-/// Locks `mutex`, ignoring poisoning. A panic in some other thread while it
-/// held the lock must not make every later log call panic too: the sets
-/// guarded here stay valid after any panic.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// A [`LogSink`] that writes every diagnostic into the project's

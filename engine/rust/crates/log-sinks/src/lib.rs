@@ -8,7 +8,8 @@ pub use console::ConsoleSink;
 pub use file_vfs::{FileSink, LogVfs, NativeLogVfs, default_route};
 
 use log_core::{Diagnostic, LogSink, Severity};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, RwLock};
+use utilities::sync::{read, write};
 
 /// Fans a diagnostic out to every registered [`LogSink`]. This is the object
 /// FFI bindings hold a handle to.
@@ -27,24 +28,15 @@ impl Logger {
     }
     /// The function what adds a shink
     pub fn add_sink(&self, sink: Box<dyn LogSink>) {
-        self.sinks
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(Arc::from(sink));
+        write(&self.sinks).push(Arc::from(sink));
     }
     /// The function that sets the minimum severity of the logs
     pub fn set_min_severity(&self, severity: Severity) {
-        *self
-            .min_severity
-            .write()
-            .unwrap_or_else(PoisonError::into_inner) = severity;
+        *write(&self.min_severity) = severity;
     }
     /// The emit function
     pub fn emit(&self, diagnostic: Diagnostic) {
-        let min = *self
-            .min_severity
-            .read()
-            .unwrap_or_else(PoisonError::into_inner);
+        let min = *read(&self.min_severity);
         if diagnostic.severity < min {
             return;
         }
@@ -65,10 +57,7 @@ impl Logger {
     /// sink may log or add another sink from inside `emit` without
     /// deadlocking on the `RwLock`.
     fn sink_snapshot(&self) -> Vec<Arc<dyn LogSink>> {
-        self.sinks
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        read(&self.sinks).clone()
     }
 }
 

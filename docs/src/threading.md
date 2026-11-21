@@ -127,7 +127,7 @@ pool.parallel_for(0..1_000, |i| {
   single-threaded builds use it because it is deterministic.
 * **No lock is held while job code runs.** The crate's mutexes only guard a few lines of its own queue and slot
   code, so what a job does inside its closure cannot deadlock the pool through them. Poisoned locks are taken back
-  instead of propagating a panic.
+  instead of propagating a panic (`utilities::sync::lock`).
 * **Closures are `Send + 'static`.** Jobs that borrow from the caller's stack need scoped jobs (T3) or a task graph (T4).
 
 ## Scoped jobs, `join` and the parallel loops (T3)

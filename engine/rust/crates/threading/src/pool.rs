@@ -261,15 +261,23 @@ impl Shared {
         *seen_epoch = epoch;
         if let Some(used) = scratch::begin_frame() {
             let counters = &self.counters[index];
-            counters.scratch_frames.fetch_add(1, Ordering::Relaxed);
+            // The peak first, the frame count second (with `Release`): a snapshot that sees the new frame count
+            // (it reads it with `Acquire`) also sees the peak of the frame that ended.
             counters
                 .scratch_peak
                 .fetch_max(u64::try_from(used).unwrap_or(u64::MAX), Ordering::Relaxed);
+            counters.scratch_frames.fetch_add(1, Ordering::Release);
         }
     }
 
-    /// A worker that found nothing to do sleeps until there is something again.
-    fn idle(&self, index: usize) {
+    /// A worker that found nothing to do sleeps until there is something again: a queued job, the shutdown, or a
+    /// new scratch frame that it has not seen yet (`seen_epoch` is the frame it last reset for).
+    ///
+    /// The frame belongs in the check under the sleep lock. `begin_scratch_frame` raises the epoch and then takes
+    /// that lock to notify; a worker that had looked at the epoch just before it changed and reaches the lock
+    /// after the notification would otherwise find nothing to stay awake for and sleep through the frame, until
+    /// some unrelated job woke it.
+    fn idle(&self, index: usize, seen_epoch: u64) {
         let started = self.timing.then(Instant::now);
         if let Some(at) = started {
             self.notify(|observer| {
@@ -280,9 +288,11 @@ impl Shared {
                 });
             });
         }
-        let slept = self
-            .sleep
-            .wait_unless(|| self.queues.queued() > 0 || self.shutting_down.load(Ordering::SeqCst));
+        let slept = self.sleep.wait_unless(|| {
+            self.queues.queued() > 0
+                || self.shutting_down.load(Ordering::SeqCst)
+                || self.scratch_epoch.load(Ordering::Acquire) != seen_epoch
+        });
         let counters = &self.counters[index];
         if slept {
             counters.sleeps.fetch_add(1, Ordering::Relaxed);
@@ -682,7 +692,7 @@ fn worker_main(
             scratch::uninstall();
             return;
         }
-        shared.idle(index);
+        shared.idle(index, seen_epoch);
     }
 }
 

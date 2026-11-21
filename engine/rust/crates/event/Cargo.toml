@@ -13,6 +13,7 @@ logging = ["dep:log-core"]
 
 [dependencies]
 threading = { path = "../threading" }
+utilities = { path = "../utilities" }
 log-core = { path = "../log-core", optional = true }
 
 [dev-dependencies]
