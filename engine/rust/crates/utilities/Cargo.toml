@@ -1,6 +1,6 @@
 [package]
 name = "utilities"
-description = "Placeholder for the engine's shared helper types and functions; not yet implemented"
+description = "Coreverse's small shared helpers: poison-tolerant lock functions, a scope guard (defer), a cache-line padded wrapper and const FNV-1a hashing; no dependencies, no unsafe code"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
