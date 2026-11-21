@@ -530,6 +530,27 @@ mod scratch {
     }
 
     #[test]
+    fn a_frame_announced_right_after_a_job_is_never_missed() {
+        // The worker is on its way to sleep while the frame is announced: it must still reset, not sleep through
+        // the frame until some other job wakes it.
+        let rounds: u64 = if cfg!(miri) { 8 } else { 300 };
+        let pool = with_arenas(1, 4096);
+        for round in 1..=rounds {
+            let used = answer_on_a_worker(&pool, || {
+                with_scratch(|arena| {
+                    arena.alloc(1_u8).unwrap();
+                    arena.used()
+                })
+            });
+            assert_eq!(used, Some(1), "round {round} starts with an empty arena");
+            pool.begin_scratch_frame();
+            eventually("the worker reset its arena", || {
+                pool.stats().workers[0].scratch_frames >= round
+            });
+        }
+    }
+
+    #[test]
     fn a_frame_announced_during_a_job_waits_until_the_job_is_done() {
         let pool = Arc::new(with_arenas(1, 4096));
         let for_job = Arc::clone(&pool);

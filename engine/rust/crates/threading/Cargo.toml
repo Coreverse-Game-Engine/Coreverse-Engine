@@ -11,6 +11,7 @@ ccore = { path = "../ccore" }
 memory = { path = "../memory" }
 platform = { path = "../platform" }
 thiserror.workspace = true
+utilities = { path = "../utilities" }
 
 [lints]
 workspace = true

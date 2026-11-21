@@ -9,6 +9,7 @@ license.workspace = true
 inventory.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+utilities = { path = "../utilities" }
 
 [lints]
 workspace = true

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::sync::{OnceLock, PoisonError, RwLock};
+use std::sync::{OnceLock, RwLock};
+use utilities::sync::{read, write};
 
 /// Static description of a diagnostic **producer** - the actual tool that
 /// generated the diagnostic (compiler, linter, IDE inspection engine, engine
@@ -122,9 +123,7 @@ pub fn register_dynamic(
             "Producer code '{code}' is already statically registered"
         ));
     }
-    let mut reg = dynamic_registry()
-        .write()
-        .unwrap_or_else(PoisonError::into_inner);
+    let mut reg = write(dynamic_registry());
     if reg.contains_key(&code) {
         return Err(format!("Producer code '{code}' is already registered"));
     }
@@ -154,21 +153,11 @@ pub fn lookup(code: &str) -> Option<ProducerInfo> {
     if let Some(info) = static_registry().get(code) {
         return Some(*info);
     }
-    dynamic_registry()
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(code)
-        .copied()
+    read(dynamic_registry()).get(code).copied()
 }
 /// Function what returns all
 pub fn all() -> Vec<ProducerInfo> {
     let mut out: Vec<ProducerInfo> = static_registry().values().copied().collect();
-    out.extend(
-        dynamic_registry()
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .values()
-            .copied(),
-    );
+    out.extend(read(dynamic_registry()).values().copied());
     out
 }

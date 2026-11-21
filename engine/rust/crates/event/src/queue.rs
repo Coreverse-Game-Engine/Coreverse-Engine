@@ -5,7 +5,9 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::bus::{EventBus, lock};
+use utilities::sync::lock;
+
+use crate::bus::EventBus;
 
 /// A posted event, ready to be delivered: it owns the event and knows its type.
 pub(crate) struct Queued {

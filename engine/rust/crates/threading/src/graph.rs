@@ -23,7 +23,9 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
+
+use utilities::sync::into_inner;
 
 use crate::error::{ThreadingError, ThreadingResult};
 use crate::job::{JobPanic, PanicPayload, discard_payload};
@@ -577,10 +579,7 @@ fn run_graph(shared: &Arc<Shared>, graph: &mut TaskGraph<'_>) -> Result<(), Grap
     });
 
     let skipped = run.skipped.load(Ordering::Relaxed);
-    let mut panics = run
-        .panics
-        .into_inner()
-        .unwrap_or_else(PoisonError::into_inner);
+    let mut panics = into_inner(run.panics);
     if panics.is_empty() {
         return Ok(());
     }

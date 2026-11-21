@@ -1,14 +1,19 @@
 //! The event bus: typed handler lists behind one short lock.
+//!
+//! The locks are taken with [`utilities::sync::lock`], which ignores poisoning. Handler code never runs while one
+//! of them is held, so a poisoned lock can only come from a bug in the few lines of this module that run under
+//! it; those lines leave the data consistent at every point where they could panic.
 
 use std::any::{Any, TypeId, type_name};
 use std::collections::HashMap;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use threading::Spawner;
+use utilities::sync::{into_inner, lock};
 
 use crate::diagnostics::{
     BusStats, EventTypeInfo, HandlerKind, Probe, Site, SlowConfig, SlowHandler, Stats,
@@ -36,14 +41,6 @@ struct Channel {
 }
 
 const CHANNEL_MISMATCH: &str = "a channel holds the handler list of its TypeId's event type";
-
-/// Locks the channel map and ignores poisoning.
-///
-/// Handler code never runs while this lock is held, so a poisoned lock can only come from a bug in the few lines
-/// of this module that run under it; those lines leave the map consistent at every point where they could panic.
-pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 fn slots_ref<E: 'static>(channel: &Channel) -> &Slots<E> {
     channel
@@ -899,9 +896,7 @@ impl EventBus {
             });
         }
 
-        let payload = first_panic
-            .into_inner()
-            .unwrap_or_else(PoisonError::into_inner);
+        let payload = into_inner(first_panic);
         if let Some(payload) = payload {
             resume_unwind(payload);
         }

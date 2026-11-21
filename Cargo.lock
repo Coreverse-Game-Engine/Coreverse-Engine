@@ -488,6 +488,7 @@ dependencies = [
  "criterion",
  "log-core",
  "threading",
+ "utilities",
 ]
 
 [[package]]
@@ -802,6 +803,7 @@ dependencies = [
  "inventory",
  "serde",
  "serde_json",
+ "utilities",
 ]
 
 [[package]]
@@ -809,6 +811,7 @@ name = "log-sinks"
 version = "0.1.0"
 dependencies = [
  "log-core",
+ "utilities",
 ]
 
 [[package]]
@@ -1753,6 +1756,7 @@ dependencies = [
  "memory",
  "platform",
  "thiserror 2.0.21",
+ "utilities",
 ]
 
 [[package]]

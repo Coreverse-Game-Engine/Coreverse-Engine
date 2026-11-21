@@ -268,7 +268,8 @@ impl Counters {
             sleeps: self.sleeps.load(Ordering::Relaxed),
             busy: Duration::from_nanos(self.busy_nanos.load(Ordering::Relaxed)),
             slept: Duration::from_nanos(self.slept_nanos.load(Ordering::Relaxed)),
-            scratch_frames: self.scratch_frames.load(Ordering::Relaxed),
+            // Read before the peak, see `Shared::refresh_scratch`: seeing a frame means seeing its peak.
+            scratch_frames: self.scratch_frames.load(Ordering::Acquire),
             scratch_peak: usize::try_from(self.scratch_peak.load(Ordering::Relaxed))
                 .unwrap_or(usize::MAX),
         }

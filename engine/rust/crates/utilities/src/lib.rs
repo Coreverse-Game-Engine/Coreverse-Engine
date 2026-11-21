@@ -6,7 +6,8 @@
 //!
 //! * [`sync`]: [`lock`](sync::lock), [`read`](sync::read), [`write`](sync::write) and
 //!   [`into_inner`](sync::into_inner), the standard lock operations with poisoning ignored (`threading`, `event`
-//!   and `log-sinks` each carry a private copy of `lock` today).
+//!   and `log-sinks` used to carry a private copy of `lock` each; `log-core` and `log-sinks` repeated the
+//!   `RwLock` idiom).
 //! * [`Defer`] and [`defer`](fn@defer): run a closure when a scope ends, on every path out of it.
 //! * [`CachePadded`]: a wrapper that gives a value a cache line of its own, against false sharing.
 //! * [`fnv1a_32`] and [`fnv1a_64`]: `const` FNV-1a hashes of bytes, for stable name hashes.
