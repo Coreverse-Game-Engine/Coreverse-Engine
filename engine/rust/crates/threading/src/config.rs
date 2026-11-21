@@ -103,12 +103,19 @@ impl PoolConfig {
     /// priorities, handles, scopes and [`JobHandle::then_on`](crate::JobHandle::then_on) all work on it.
     ///
     /// ```
+    /// use std::sync::mpsc;
+    ///
     /// use threading::{PoolConfig, ThreadPool, ThreadRole};
     ///
     /// let io = ThreadPool::new(PoolConfig::io())?;
     /// assert_eq!(io.worker_count(), 2);
-    /// let role = io.spawn(ThreadRole::current).wait();
-    /// assert_eq!(role, ThreadRole::Io);
+    /// assert_eq!(io.role(), ThreadRole::Io);
+    ///
+    /// // The job reports its role through a channel and the calling thread only receives. A thread that
+    /// // waits on a `JobHandle` may help and run the job itself, and would then report its own role.
+    /// let (sender, receiver) = mpsc::channel();
+    /// drop(io.spawn(move || sender.send(ThreadRole::current()).unwrap()));
+    /// assert_eq!(receiver.recv().unwrap(), ThreadRole::Io);
     /// # Ok::<(), threading::ThreadingError>(())
     /// ```
     #[must_use]
