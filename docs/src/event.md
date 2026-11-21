@@ -2,8 +2,9 @@
 
 `engine/rust/crates/event` is the engine's event infrastructure. It is being built in milestones; this page describes
 what exists (E1, the synchronous bus; E2, interceptors, cancellable events and one-shot handlers; E3, queued
-events and a cross-thread sender; E4, delivery as jobs on the `threading` pool) and what is planned. The crate
-uses `std` and the `threading` crate (for E4 only) and has no `unsafe` code.
+events and a cross-thread sender; E4, delivery as jobs on the `threading` pool; E5, counters, handler counts,
+slow-handler reports and benchmarks). The crate uses `std` and the `threading` crate (for E4 only), has no `unsafe`
+code, and has one optional feature: `logging` (see "Diagnostics and benchmarks (E5)").
 
 ## What is there
 
@@ -18,6 +19,10 @@ uses `std` and the `threading` crate (for E4 only) and has no `unsafe` code.
 | `Cancellable<E>`| An event with a veto flag: `new`, `cancel`, `is_cancelled`, `into_inner`; dereferences to `E`.                                                                  |
 | `EventSender`   | The producer end of the queue: a cloneable, `Send + Sync` handle that posts events from any thread and does not keep the bus alive. `post`, `is_connected`.     |
 | `PostError<E>`  | What `EventSender::post` returns once the bus is gone; `into_inner()` gives the event back.                                                                      |
+| `BusStats`      | A snapshot of the counters: `publishes`, `handler_calls`, `posted`, `dispatched`, `max_pending`, `slow_handlers`.                                               |
+| `EventTypeInfo` | One event type with handlers: `name`, `observers`, `interceptors`, `one_shot`, `total`.                                                                          |
+| `SlowHandler`   | A slow-handler report: `event_type`, `handler_id`, `priority`, `kind`, `elapsed`, `threshold` (and `to_diagnostic` with the `logging` feature).                 |
+| `HandlerKind`   | `Observer` or `Interceptor`.                                                                                                                                     |
 
 | Method                                                    | Handler gets | Runs for                         | Notes                                                       |
 |:----------------------------------------------------------|:-------------|:---------------------------------|:------------------------------------------------------------|
@@ -32,6 +37,9 @@ uses `std` and the `threading` crate (for E4 only) and has no `unsafe` code.
 | `pending()`, `clear_pending()`, `sender()`                |              |                                  | Queue length, discard the queue, get an `EventSender`.      |
 | `publish_parallel(&Spawner, &E) -> usize` where `E: Sync` |              |                                  | Runs the observers as jobs; a priority is a phase.          |
 | `dispatch_parallel(&Spawner) -> usize`                    |              |                                  | Delivers the queued events of different types at the same time. |
+| `set_stats_enabled`, `stats_enabled`, `stats`, `reset_stats` |           |                                  | The counters (off by default).                              |
+| `handler_counts() -> Vec<EventTypeInfo>`                  |              |                                  | Handlers per event type.                                    |
+| `set_slow_handler_hook(threshold, hook)`, `clear_slow_handler_hook` | |                                  | Reports handlers that run for `threshold` or longer.        |
 
 ```rust,ignore
 use event::{Cancellable, EventBus, EventPriority, Flow};
@@ -173,6 +181,52 @@ parallel loops (T3).
   type. The `threading` crate's task graphs (T4) are not used: the ordering rules here are fixed (priorities, type
   groups), so there is nothing to schedule by hand.
 
+## Diagnostics and benchmarks (E5)
+
+Everything here is off until it is asked for, and costs nothing but a load per publish while it is off.
+
+* **Counters.** `bus.set_stats_enabled(true)` starts them; `bus.stats()` returns a `BusStats` snapshot and
+  `bus.reset_stats()` zeroes it. They count publishes (every way of delivering, queued events included, which go
+  through `publish_mut`; a publish nobody listens to counts), handler calls, posts, delivered queued events, the
+  longest the queue was right after a post, and slow handlers. Each is one relaxed atomic addition on the bus's
+  shared state, so a bus that many threads publish to at the same moment pays for the contention: leave the counters
+  off in release builds that do not look at them. A snapshot reads the counters one after the other and need not be
+  consistent between its fields while other threads publish.
+* **Handler counts.** `bus.handler_counts()` returns one `EventTypeInfo` per event type that has handlers (observers,
+  interceptors, and how many of the observers are one-shot), sorted by type name. The name is what
+  `std::any::type_name` returns: good for a log line or an inspector, not for matching.
+* **Slow handlers.** `bus.set_slow_handler_hook(threshold, hook)` calls `hook` with a `SlowHandler` for every handler
+  that ran for `threshold` or longer. All five ways of delivering are measured, interceptors included. The hook runs
+  on the thread that ran the handler (a worker thread for the parallel methods), after the handler returned, without
+  any lock of the bus: it may use the bus, even set or clear the hook. A publish keeps the hook, and the counter
+  setting, that it started with. A handler that panics is not reported. The time is the handler's own, so a handler
+  that publishes another event is measured with everything that event ran. `Duration::ZERO` reports everything.
+* **Through the logger (`logging` feature).** The `event` crate does not depend on the logging crates by default:
+  like `memory`, it exposes plain data and lets the application decide. With `--features logging`,
+  `SlowHandler::to_diagnostic()` builds a `log_core::Diagnostic`: code `CV-EVENT-SLOW-0001`, severity `Warning`,
+  module `event`, and the event type, handler id, kind, priority and the times in microseconds as extra fields.
+  The application connects the two:
+
+  ```rust,ignore
+  let logger = std::sync::Arc::clone(&logger); // a log_sinks::Logger
+  bus.set_slow_handler_hook(std::time::Duration::from_millis(2), move |slow| {
+      logger.emit(slow.to_diagnostic());
+  });
+  ```
+
+  CI builds and tests the workspace with `--all-features`, so the bridge is covered there; locally use
+  `cargo test -p event --features logging`.
+* **Benchmarks.** `benches/event_bench.rs` (criterion, `cargo bench -p event`): `publish/*` and `publish_mut/*`
+  (0, 1 and 8 observers, 4 interceptors, and the counters and the slow-handler detection switched on),
+  `subscribe/*` (subscribe and drop on an empty and on a busy bus), `queue/*` (1000 posts and a dispatch, from the
+  bus and from a sender), and `parallel/*` (four heavy observers or four event types with a heavy observer each,
+  delivered sequentially and as jobs on four workers). Compare the variants of one group with each other; the
+  absolute numbers belong to the machine.
+* **No FFI.** The C++ side has no use for this crate today, and typed Rust events do not cross a C ABI: an FFI
+  surface would have to invent a second, untyped event system (numeric event ids and byte payloads). That belongs to
+  the day a C++ system needs to publish or receive events; the diagnostics above are plain data and are easy to
+  expose then.
+
 ## Why these choices
 
 * **`'static` types instead of an `Event` trait.** No derive or impl is needed to make something an event, and the
@@ -203,5 +257,5 @@ parallel loops (T3).
 | E1        | Synchronous typed bus, priorities, subscription handles, thread-safe, re-entrancy-safe. Done.                                                                            |
 | E2        | Interceptors (`subscribe_mut`, `publish_mut`, `Flow`, `Dispatch`), `Cancellable`, one-shot handlers (`subscribe_once`). Done (this page).                                |
 | E3        | Queued events: `post`, `dispatch`, `pending`, `clear_pending`, and the cross-thread `EventSender`/`PostError`. Done.                                                    |
-| E4        | `threading` integration: `publish_parallel` (priority phases) and `dispatch_parallel` (type groups) on a `Spawner`. Done (this page).                                    |
-| E5        | Diagnostics (handler counts, slow-handler reporting through the logger), benchmarks, FFI exposure if the C++ side needs it.                                              |
+| E4        | `threading` integration: `publish_parallel` (priority phases) and `dispatch_parallel` (type groups) on a `Spawner`. Done.                                               |
+| E5        | Counters, handler counts, slow-handler reports (with the `logging` bridge), criterion benchmarks. Done (this page). No FFI surface yet, see above.                       |

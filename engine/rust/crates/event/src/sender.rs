@@ -57,7 +57,7 @@ impl EventSender {
     pub fn post<E: Send + 'static>(&self, event: E) -> Result<(), PostError<E>> {
         match self.inner.upgrade() {
             Some(inner) => {
-                inner.queue.push(queued(event));
+                inner.enqueue(queued(event));
                 Ok(())
             }
             None => Err(PostError { event }),

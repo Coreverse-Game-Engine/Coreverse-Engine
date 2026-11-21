@@ -1,14 +1,18 @@
 //! The event bus: typed handler lists behind one short lock.
 
-use std::any::{Any, TypeId};
+use std::any::{Any, TypeId, type_name};
 use std::collections::HashMap;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::time::Duration;
 
 use threading::Spawner;
 
+use crate::diagnostics::{
+    BusStats, EventTypeInfo, HandlerKind, Probe, Site, SlowConfig, SlowHandler, Stats,
+};
 use crate::flow::{Dispatch, Flow};
 use crate::priority::EventPriority;
 use crate::queue::{Queue, Queued, queued};
@@ -19,8 +23,17 @@ use crate::subscription::Subscription;
 /// changed in place, while a `publish` holds it (copy on write through [`Arc::make_mut`]).
 type Slots<E> = Arc<Vec<Slot<E>>>;
 
-/// One handler list, with its event type erased. The `TypeId` that keys it names the `Slots<E>` inside.
-type Channel = Box<dyn Any + Send + Sync>;
+/// How many observers, interceptors and one-shot handlers a channel holds.
+type Summary = (usize, usize, usize);
+
+/// One handler list, with its event type erased. The `TypeId` that keys it names the `Slots<E>` inside `slots`.
+struct Channel {
+    /// The name of the event type, for diagnostics.
+    name: &'static str,
+    slots: Box<dyn Any + Send + Sync>,
+    /// Counts the handlers of this channel; instantiated for the event type when the channel is made.
+    summary: fn(&Channel) -> Summary,
+}
 
 const CHANNEL_MISMATCH: &str = "a channel holds the handler list of its TypeId's event type";
 
@@ -33,11 +46,44 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 fn slots_ref<E: 'static>(channel: &Channel) -> &Slots<E> {
-    channel.downcast_ref::<Slots<E>>().expect(CHANNEL_MISMATCH)
+    channel
+        .slots
+        .downcast_ref::<Slots<E>>()
+        .expect(CHANNEL_MISMATCH)
 }
 
 fn slots_mut<E: 'static>(channel: &mut Channel) -> &mut Slots<E> {
-    channel.downcast_mut::<Slots<E>>().expect(CHANNEL_MISMATCH)
+    channel
+        .slots
+        .downcast_mut::<Slots<E>>()
+        .expect(CHANNEL_MISMATCH)
+}
+
+/// Counts the handlers of the channel of event type `E`.
+fn summarize<E: 'static>(channel: &Channel) -> Summary {
+    let mut observers = 0;
+    let mut interceptors = 0;
+    let mut one_shot = 0;
+    for slot in slots_ref::<E>(channel).iter() {
+        match &slot.handler {
+            Handler::Observer(_) => observers += 1,
+            Handler::Interceptor(_) => interceptors += 1,
+        }
+        if slot.once {
+            one_shot += 1;
+        }
+    }
+    (observers, interceptors, one_shot)
+}
+
+/// Describes the handler `slot` for the counters and the slow-handler reports.
+fn site<E: 'static>(slot: &Slot<E>, kind: HandlerKind) -> Site {
+    Site {
+        event_type: type_name::<E>(),
+        id: slot.id,
+        priority: slot.priority,
+        kind,
+    }
 }
 
 /// A handler as the bus stores it.
@@ -86,6 +132,11 @@ pub(crate) struct Inner {
     channels: Mutex<HashMap<TypeId, Channel>>,
     /// The events posted and not yet dispatched.
     pub(crate) queue: Queue,
+    /// The counters; they run only while `stats.enabled` is set.
+    stats: Stats,
+    /// Set while a slow-handler hook is installed, so that a publish can skip the lock below.
+    slow_enabled: AtomicBool,
+    slow: Mutex<Option<SlowConfig>>,
 }
 
 impl Inner {
@@ -94,6 +145,9 @@ impl Inner {
             next_id: AtomicU64::new(0),
             channels: Mutex::new(HashMap::new()),
             queue: Queue::new(),
+            stats: Stats::default(),
+            slow_enabled: AtomicBool::new(false),
+            slow: Mutex::new(None),
         }
     }
 
@@ -116,7 +170,11 @@ impl Inner {
         let mut channels = lock(&self.channels);
         let channel = channels
             .entry(TypeId::of::<E>())
-            .or_insert_with(|| -> Channel { Box::new(Slots::<E>::default()) });
+            .or_insert_with(|| Channel {
+                name: type_name::<E>(),
+                slots: Box::new(Slots::<E>::default()),
+                summary: summarize::<E>,
+            });
         let slots = Arc::make_mut(slots_mut::<E>(channel));
         // The list is sorted from the highest priority to the lowest; a new handler goes behind every handler of
         // the same or a higher priority, which keeps subscription order inside a priority.
@@ -183,6 +241,54 @@ impl Inner {
 
     fn event_type_count(&self) -> usize {
         lock(&self.channels).len()
+    }
+
+    /// One entry per event type that has at least one handler, sorted by name.
+    fn event_types(&self) -> Vec<EventTypeInfo> {
+        let mut infos: Vec<EventTypeInfo> = {
+            let channels = lock(&self.channels);
+            channels
+                .values()
+                .map(|channel| {
+                    let (observers, interceptors, one_shot) = (channel.summary)(channel);
+                    EventTypeInfo::new(channel.name, observers, interceptors, one_shot)
+                })
+                .collect()
+        };
+        infos.sort_by_key(EventTypeInfo::name);
+        infos
+    }
+
+    /// What a publish that starts now has to measure: nothing, by default.
+    fn probe(&self) -> Probe<'_> {
+        let stats = if self.stats.enabled.load(Ordering::Relaxed) {
+            Some(&self.stats)
+        } else {
+            None
+        };
+        let slow = if self.slow_enabled.load(Ordering::Acquire) {
+            lock(&self.slow).clone()
+        } else {
+            None
+        };
+        Probe::new(stats, slow)
+    }
+
+    /// Queues an event and updates the queue counters.
+    pub(crate) fn enqueue(&self, item: Queued) {
+        let pending = self.queue.push(item);
+        if self.stats.enabled.load(Ordering::Relaxed) {
+            self.stats.posted.fetch_add(1, Ordering::Relaxed);
+            let pending = u64::try_from(pending).unwrap_or(u64::MAX);
+            self.stats.max_pending.fetch_max(pending, Ordering::Relaxed);
+        }
+    }
+
+    /// Counts one queued event that a dispatch pass took up.
+    fn count_dispatched(&self) {
+        if self.stats.enabled.load(Ordering::Relaxed) {
+            self.stats.dispatched.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -441,6 +547,8 @@ impl EventBus {
     /// See the [type documentation](EventBus) for the order and for what happens when handlers subscribe,
     /// unsubscribe, publish or panic.
     pub fn publish<E: 'static>(&self, event: &E) -> usize {
+        let probe = self.inner.probe();
+        probe.publish_started();
         let Some(slots) = self.inner.snapshot::<E>() else {
             return 0;
         };
@@ -452,7 +560,9 @@ impl EventBus {
             if !self.inner.claim(slot) {
                 continue;
             }
-            (**handler)(event);
+            probe.call(site::<E>(slot, HandlerKind::Observer), || {
+                (**handler)(event);
+            });
             called += 1;
         }
         called
@@ -484,6 +594,8 @@ impl EventBus {
     /// assert_eq!(score.0, 202);
     /// ```
     pub fn publish_mut<E: 'static>(&self, event: &mut E) -> Dispatch {
+        let probe = self.inner.probe();
+        probe.publish_started();
         let Some(slots) = self.inner.snapshot::<E>() else {
             return Dispatch::default();
         };
@@ -497,10 +609,15 @@ impl EventBus {
             match &slot.handler {
                 Handler::Observer(handler) => {
                     let shared: &E = event;
-                    (**handler)(shared);
+                    probe.call(site::<E>(slot, HandlerKind::Observer), || {
+                        (**handler)(shared);
+                    });
                 }
                 Handler::Interceptor(handler) => {
-                    if (**handler)(&mut *event) == Flow::Stop {
+                    let flow = probe.call(site::<E>(slot, HandlerKind::Interceptor), || {
+                        (**handler)(&mut *event)
+                    });
+                    if flow == Flow::Stop {
                         stopped = true;
                         break;
                     }
@@ -561,7 +678,7 @@ impl EventBus {
     /// bus.post(Rc::new(1));
     /// ```
     pub fn post<E: Send + 'static>(&self, event: E) {
-        self.inner.queue.push(queued(event));
+        self.inner.enqueue(queued(event));
     }
 
     /// Delivers the events that are queued right now, in posting order, on this thread, and returns how many it
@@ -582,6 +699,7 @@ impl EventBus {
         let mut delivered = 0;
         while let Some(item) = pass.pop() {
             item.deliver(self);
+            self.inner.count_dispatched();
             delivered += 1;
         }
         delivered
@@ -648,6 +766,8 @@ impl EventBus {
     /// bus.publish_parallel(&pool.spawner(), &Cell::new(1));
     /// ```
     pub fn publish_parallel<E: Sync + 'static>(&self, spawner: &Spawner, event: &E) -> usize {
+        let probe = self.inner.probe();
+        probe.publish_started();
         let Some(slots) = self.inner.snapshot::<E>() else {
             return 0;
         };
@@ -661,7 +781,7 @@ impl EventBus {
                 .take_while(|slot| slot.priority == priority)
                 .count();
             let end = start + length;
-            called += self.run_phase(spawner, &slots[start..end], event);
+            called += self.run_phase(spawner, &slots[start..end], event, &probe);
             start = end;
         }
         called
@@ -673,6 +793,7 @@ impl EventBus {
         spawner: &Spawner,
         phase: &[Slot<E>],
         event: &E,
+        probe: &Probe<'_>,
     ) -> usize {
         let called = AtomicUsize::new(0);
         spawner.parallel_chunks(0..phase.len(), 1, |range| {
@@ -684,7 +805,9 @@ impl EventBus {
                 if !self.inner.claim(slot) {
                     continue;
                 }
-                (**handler)(event);
+                probe.call(site::<E>(slot, HandlerKind::Observer), || {
+                    (**handler)(event);
+                });
                 called.fetch_add(1, Ordering::Relaxed);
             }
         });
@@ -751,6 +874,7 @@ impl EventBus {
         let mut delivered = 0;
         while let Some(item) = pass.pop() {
             delivered += 1;
+            self.inner.count_dispatched();
             let at = *group_of.entry(item.event_type()).or_insert_with(|| {
                 groups.push(Vec::new());
                 groups.len() - 1
@@ -802,6 +926,129 @@ impl EventBus {
     /// A handle with which other threads post events to this bus; it does not keep the bus alive.
     pub fn sender(&self) -> EventSender {
         EventSender::new(Arc::downgrade(&self.inner))
+    }
+
+    /// Switches the counters of the bus on or off (they are off by default). Turning them off keeps the values.
+    ///
+    /// While on, every publish and every handler call costs one relaxed atomic addition, and every post and
+    /// every delivered queued event one more; with the counters off the only cost is a load per publish.
+    ///
+    /// ```
+    /// use event::EventBus;
+    ///
+    /// struct Tick;
+    ///
+    /// let bus = EventBus::new();
+    /// bus.set_stats_enabled(true);
+    /// let _first = bus.subscribe(|_: &Tick| {});
+    /// let _second = bus.subscribe(|_: &Tick| {});
+    ///
+    /// bus.publish(&Tick);
+    /// bus.publish(&Tick);
+    ///
+    /// let stats = bus.stats();
+    /// assert_eq!(stats.publishes(), 2);
+    /// assert_eq!(stats.handler_calls(), 4);
+    /// ```
+    pub fn set_stats_enabled(&self, enabled: bool) {
+        self.inner.stats.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Whether the counters are running.
+    pub fn stats_enabled(&self) -> bool {
+        self.inner.stats.enabled.load(Ordering::Relaxed)
+    }
+
+    /// A snapshot of the counters. The counters are read one after the other, so a snapshot taken while other
+    /// threads publish need not be consistent between its fields.
+    pub fn stats(&self) -> BusStats {
+        self.inner.stats.snapshot()
+    }
+
+    /// Sets every counter to zero; the counters keep running or stay off as they were.
+    pub fn reset_stats(&self) {
+        self.inner.stats.reset();
+    }
+
+    /// Lists the event types that have handlers and how many of each kind, sorted by type name. An event type
+    /// whose last handler went away is not listed.
+    ///
+    /// ```
+    /// use event::EventBus;
+    ///
+    /// struct Tick;
+    ///
+    /// let bus = EventBus::new();
+    /// let _once = bus.subscribe_once(|_: &Tick| {});
+    /// let _plain = bus.subscribe(|_: &Tick| {});
+    ///
+    /// let counts = bus.handler_counts();
+    /// assert_eq!(counts.len(), 1);
+    /// assert_eq!(counts[0].observers(), 2);
+    /// assert_eq!(counts[0].one_shot(), 1);
+    /// assert!(counts[0].name().ends_with("Tick"));
+    /// ```
+    pub fn handler_counts(&self) -> Vec<EventTypeInfo> {
+        self.inner.event_types()
+    }
+
+    /// Calls `hook` with a [`SlowHandler`] report for every handler that runs for `threshold` or longer. Replaces
+    /// the hook that was installed before.
+    ///
+    /// * **Every way of delivering is measured:** `publish`, `publish_mut`, `publish_parallel`, `dispatch` and
+    ///   `dispatch_parallel`, observers and interceptors alike. The time is the handler's own: a handler that
+    ///   publishes another event is measured with everything that event ran.
+    /// * **The hook runs on the thread that ran the handler**, right after the handler returned (on a worker
+    ///   thread for the parallel methods), so it must be `Send + Sync` and should be quick. It may use the bus,
+    ///   including setting or clearing the hook: no lock of the bus is held while it runs. A panic in the hook
+    ///   unwinds like a panic in a handler.
+    /// * **A publish keeps the hook it started with.** Installing, replacing or clearing a hook affects the
+    ///   publishes that start afterwards; the same holds for switching the counters on or off.
+    /// * **A handler that panics is not reported.** `Duration::ZERO` reports every handler.
+    /// * **Cost:** with no hook installed, nothing is measured. With one, every handler call is bracketed by two
+    ///   `Instant::now()` calls, and a publish clones an `Arc`.
+    ///
+    /// With the `logging` feature, `SlowHandler::to_diagnostic` turns a report into a warning for the logger.
+    ///
+    /// ```
+    /// use std::sync::{Arc, Mutex};
+    /// use std::time::Duration;
+    ///
+    /// use event::EventBus;
+    ///
+    /// struct Load;
+    ///
+    /// let bus = EventBus::new();
+    /// let reports = Arc::new(Mutex::new(Vec::new()));
+    /// let sink = Arc::clone(&reports);
+    /// bus.set_slow_handler_hook(Duration::from_millis(5), move |report| {
+    ///     sink.lock().unwrap().push(report.elapsed());
+    /// });
+    ///
+    /// let _subscription = bus.subscribe(|_: &Load| std::thread::sleep(Duration::from_millis(20)));
+    /// bus.publish(&Load);
+    /// assert_eq!(reports.lock().unwrap().len(), 1);
+    /// ```
+    pub fn set_slow_handler_hook<F>(&self, threshold: Duration, hook: F)
+    where
+        F: Fn(&SlowHandler) + Send + Sync + 'static,
+    {
+        let config = SlowConfig {
+            threshold,
+            hook: Arc::new(hook),
+        };
+        let previous = lock(&self.inner.slow).replace(config);
+        self.inner.slow_enabled.store(true, Ordering::Release);
+        // The old hook is dropped here, after the lock is released: what it captured may use the bus.
+        drop(previous);
+    }
+
+    /// Removes the slow-handler hook; nothing is measured afterwards.
+    pub fn clear_slow_handler_hook(&self) {
+        self.inner.slow_enabled.store(false, Ordering::Release);
+        let previous = lock(&self.inner.slow).take();
+        // Dropped after the lock is released, like the hook that `set_slow_handler_hook` replaces.
+        drop(previous);
     }
 
     /// A handle that does not keep the bus alive; what a handler captures when it needs the bus.

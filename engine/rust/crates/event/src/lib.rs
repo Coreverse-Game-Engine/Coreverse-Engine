@@ -1,9 +1,10 @@
 //! `event` — the event infrastructure of the Coreverse Engine: a typed publish/subscribe bus that calls handlers
 //! synchronously, in a defined order, with subscriptions that clean up after themselves.
 //!
-//! The crate is built in milestones. This is **E4**: the synchronous bus (E1), interceptors, cancellable events
-//! and one-shot handlers (E2), queued events with a cross-thread sender (E3), and delivery as jobs on the
-//! `threading` pool (E4). Diagnostics and benchmarks follow (see `docs/src/event.md`).
+//! The crate is built in milestones. This is **E5**, the last one: the synchronous bus (E1), interceptors,
+//! cancellable events and one-shot handlers (E2), queued events with a cross-thread sender (E3), delivery as jobs
+//! on the `threading` pool (E4), and counters, handler counts and slow-handler reports (E5); the criterion
+//! benchmarks are in `benches/event_bench.rs` (see `docs/src/event.md`).
 //!
 //! # What is here today
 //!
@@ -26,6 +27,12 @@
 //!   when they are done), and [`dispatch_parallel`](EventBus::dispatch_parallel) delivers the queued events of
 //!   different types at the same time while keeping each type's posting order. Both take a
 //!   [`threading::Spawner`], which works from any thread, including inside a job.
+//! * Diagnostics, all off by default: [`EventBus::set_stats_enabled`] and [`EventBus::stats`] (a [`BusStats`] with
+//!   publishes, handler calls, posts, dispatches, the longest queue and slow handlers),
+//!   [`EventBus::handler_counts`] (an [`EventTypeInfo`] per event type: observers, interceptors, one-shot
+//!   handlers), and [`EventBus::set_slow_handler_hook`], which calls a function with a [`SlowHandler`] report
+//!   for every handler that ran longer than a threshold. With the `logging` feature a report becomes a
+//!   diagnostic of the logging core (`SlowHandler::to_diagnostic`).
 //! * [`Subscription`]: what `subscribe` returns. **Dropping it unsubscribes the handler**;
 //!   [`detach`](Subscription::detach) keeps the handler for the life of the bus.
 //! * [`EventPriority`]: `High`, `Normal` (default) and `Low`. Same priority: subscription order.
@@ -50,13 +57,14 @@
 //!
 //! # Conventions
 //!
-//! * `std` and the `threading` crate; no `unsafe` code.
+//! * `std` and the `threading` crate (plus `log-core` with the optional `logging` feature); no `unsafe` code.
 //! * A lock of this crate is never held while handler code runs, so a handler cannot deadlock the bus by what it
 //!   does (subscribing, unsubscribing, publishing, or dropping a [`Subscription`]).
 //! * A panic in a handler is not caught: it unwinds through [`EventBus::publish`] to its caller.
 
 mod bus;
 mod cancellable;
+mod diagnostics;
 mod flow;
 mod priority;
 mod queue;
@@ -65,6 +73,7 @@ mod subscription;
 
 pub use bus::{EventBus, WeakEventBus};
 pub use cancellable::Cancellable;
+pub use diagnostics::{BusStats, EventTypeInfo, HandlerKind, SlowHandler};
 pub use flow::{Dispatch, Flow};
 pub use priority::EventPriority;
 pub use sender::{EventSender, PostError};

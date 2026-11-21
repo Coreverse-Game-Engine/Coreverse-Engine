@@ -52,8 +52,11 @@ impl Queue {
         }
     }
 
-    pub(crate) fn push(&self, item: Queued) {
-        lock(&self.items).push_back(item);
+    /// Appends an event and returns how many events wait afterwards.
+    pub(crate) fn push(&self, item: Queued) -> usize {
+        let mut items = lock(&self.items);
+        items.push_back(item);
+        items.len()
     }
 
     /// How many events wait for the next pass (events of a pass in progress are not counted).
