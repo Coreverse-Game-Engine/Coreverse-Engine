@@ -1,8 +1,13 @@
 //! How a [`ThreadPool`](crate::ThreadPool) is set up.
 
+use std::fmt;
+use std::sync::Arc;
+
+use memory::MemoryTag;
 use platform::thread::ThreadPriority;
 
 use crate::error::{ThreadingError, ThreadingResult};
+use crate::observe::JobObserver;
 use crate::role::ThreadRole;
 
 /// The largest number of workers a pool accepts. A guard against a typo (or an overflowed computation) asking
@@ -78,11 +83,25 @@ pub struct PoolConfig {
     name_prefix: String,
     thread_priority: ThreadPriority,
     role: ThreadRole,
+    scratch_capacity: Option<usize>,
+    scratch_tag: MemoryTag,
+    observer: Option<ObserverRef>,
+    timing: bool,
+}
+
+/// The observer of a config, wrapped so that the config can still be `Debug`.
+#[derive(Clone)]
+struct ObserverRef(Arc<dyn JobObserver>);
+
+impl fmt::Debug for ObserverRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("JobObserver")
+    }
 }
 
 impl PoolConfig {
-    /// The defaults: [`WorkerCount::Auto`], the prefix [`DEFAULT_NAME_PREFIX`], normal thread priority and the
-    /// role [`ThreadRole::Worker`].
+    /// The defaults: [`WorkerCount::Auto`], the prefix [`DEFAULT_NAME_PREFIX`], normal thread priority, the
+    /// role [`ThreadRole::Worker`], no scratch memory, no observer and no timing.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -90,6 +109,10 @@ impl PoolConfig {
             name_prefix: DEFAULT_NAME_PREFIX.to_owned(),
             thread_priority: ThreadPriority::Normal,
             role: ThreadRole::Worker,
+            scratch_capacity: None,
+            scratch_tag: MemoryTag::General,
+            observer: None,
+            timing: false,
         }
     }
 
@@ -104,15 +127,13 @@ impl PoolConfig {
     ///
     /// ```
     /// use std::sync::mpsc;
-    ///
     /// use threading::{PoolConfig, ThreadPool, ThreadRole};
     ///
     /// let io = ThreadPool::new(PoolConfig::io())?;
     /// assert_eq!(io.worker_count(), 2);
-    /// assert_eq!(io.role(), ThreadRole::Io);
     ///
-    /// // The job reports its role through a channel and the calling thread only receives. A thread that
-    /// // waits on a `JobHandle` may help and run the job itself, and would then report its own role.
+    /// // The job reports its role through a channel: waiting for its handle could make this thread run
+    /// // the job itself (a waiting thread helps), and this thread's role is not `Io`.
     /// let (sender, receiver) = mpsc::channel();
     /// drop(io.spawn(move || sender.send(ThreadRole::current()).unwrap()));
     /// assert_eq!(receiver.recv().unwrap(), ThreadRole::Io);
@@ -159,6 +180,44 @@ impl PoolConfig {
         self
     }
 
+    /// Gives every worker a scratch arena of `bytes` bytes (a [`FrameArena`](memory::FrameArena)), allocated
+    /// when the pool starts. Jobs reach the arena of the thread they run on with
+    /// [`with_scratch`](crate::with_scratch); [`ThreadPool::begin_scratch_frame`](crate::ThreadPool::begin_scratch_frame)
+    /// frees them for the next frame. The memory is registered with the tag set by
+    /// [`with_scratch_tag`](Self::with_scratch_tag) (default [`MemoryTag::General`]), so it appears in memory
+    /// reports. A pool without workers has no worker threads and therefore no arenas.
+    #[must_use]
+    pub fn with_scratch(mut self, bytes: usize) -> Self {
+        self.scratch_capacity = Some(bytes);
+        self
+    }
+
+    /// Sets the [`MemoryTag`] the scratch arenas are registered with (default [`MemoryTag::General`]).
+    #[must_use]
+    pub fn with_scratch_tag(mut self, tag: MemoryTag) -> Self {
+        self.scratch_tag = tag;
+        self
+    }
+
+    /// Installs a [`JobObserver`] that receives the events of the pool. Installing one also turns timing on,
+    /// since the events carry durations.
+    #[must_use]
+    pub fn with_observer(mut self, observer: Arc<dyn JobObserver>) -> Self {
+        self.observer = Some(ObserverRef(observer));
+        self
+    }
+
+    /// Turns the time measurement of the statistics on or off (default off): with it, [`WorkerStats::busy`] and
+    /// [`WorkerStats::slept`](crate::WorkerStats::slept) count time, at the price of two clock reads per job
+    /// and per sleep. An installed observer turns it on regardless.
+    ///
+    /// [`WorkerStats::busy`]: crate::WorkerStats::busy
+    #[must_use]
+    pub fn with_timing(mut self, on: bool) -> Self {
+        self.timing = on;
+        self
+    }
+
     /// The configured worker count (not yet resolved; see [`WorkerCount::resolve`]).
     #[must_use]
     pub fn workers(&self) -> WorkerCount {
@@ -183,6 +242,30 @@ impl PoolConfig {
         self.role
     }
 
+    /// The size of each worker's scratch arena in bytes, if one was asked for.
+    #[must_use]
+    pub fn scratch_capacity(&self) -> Option<usize> {
+        self.scratch_capacity
+    }
+
+    /// The tag the scratch arenas are registered with.
+    #[must_use]
+    pub fn scratch_tag(&self) -> MemoryTag {
+        self.scratch_tag
+    }
+
+    /// The installed observer, if any.
+    #[must_use]
+    pub fn observer(&self) -> Option<&Arc<dyn JobObserver>> {
+        self.observer.as_ref().map(|observer| &observer.0)
+    }
+
+    /// Whether time measurement was asked for with [`with_timing`](Self::with_timing).
+    #[must_use]
+    pub fn timing(&self) -> bool {
+        self.timing
+    }
+
     /// Checks the settings without starting anything.
     ///
     /// # Errors
@@ -200,6 +283,11 @@ impl PoolConfig {
         {
             return Err(ThreadingError::InvalidConfig {
                 reason: "the worker count is above MAX_WORKERS",
+            });
+        }
+        if self.scratch_capacity == Some(0) {
+            return Err(ThreadingError::InvalidConfig {
+                reason: "the scratch capacity is 0",
             });
         }
         Ok(())

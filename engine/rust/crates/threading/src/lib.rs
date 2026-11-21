@@ -1,10 +1,10 @@
 //! `threading` — the job system of the Coreverse Engine: a thread pool that runs closures as jobs and gets
 //! their results (or panics) back to the code that spawned them.
 //!
-//! The crate is built in milestones. This is **T5: dedicated threads and roles**, on top of T1 (the
-//! foundation), T2 (queues, stealing, priorities, spawners), T3 (scoped jobs, parallel loops) and T4
-//! (dependencies, task graphs); observation hooks and memory integration follow (see
-//! `docs/src/threading.md`).
+//! The crate is built in milestones. This is **T6: observation and scratch memory**, on top of T1 (the
+//! foundation), T2 (queues, stealing, priorities, spawners), T3 (scoped jobs, parallel loops), T4 (dependencies,
+//! task graphs) and T5 (dedicated threads, roles, the IO pool); benchmarks and the rest of the documentation
+//! follow (see `docs/src/threading.md`).
 //!
 //! # What is here today
 //!
@@ -48,6 +48,12 @@
 //! * [`PoolConfig::io`]: the preset of an **IO pool** (two workers named `cv-io-N`, role `Io`) so that blocking
 //!   work cannot occupy the compute workers. It is an ordinary pool created by the runtime, not a global;
 //!   [`JobHandle::then_on`] moves a result from one pool to another.
+//! * [`JobObserver`]: hooks for a profiler (a job started or finished, a job was stolen, a worker slept or woke),
+//!   installed with [`PoolConfig::with_observer`]. The crate does not depend on any profiler. [`ThreadPool::stats`]
+//!   returns always-on counters per worker ([`PoolStats`], [`WorkerStats`]).
+//! * Scratch memory: [`PoolConfig::with_scratch`] gives every worker a [`memory::FrameArena`] registered with a
+//!   [`memory::MemoryTag`]; jobs reach their thread's arena with [`with_scratch`], and
+//!   [`ThreadPool::begin_scratch_frame`] announces a new frame.
 //! * Help while waiting: a thread that waits for a job runs queued jobs instead of sleeping, so a job that
 //!   waits for another job cannot deadlock a small pool.
 //! * [`WorkerCount::Exact(0)`](WorkerCount::Exact): a pool with no threads at all. Jobs then run on the thread
@@ -83,6 +89,7 @@ mod dedicated;
 mod error;
 mod graph;
 mod job;
+mod observe;
 mod parallel;
 mod pool;
 mod priority;
@@ -93,6 +100,7 @@ mod role;
     reason = "scoped jobs hide the lifetime of the data they borrow from the pool's queues; the module documents the invariants that make this sound, the single unsafe block carries a safety comment, and the public API is safe"
 )]
 mod scope;
+mod scratch;
 mod sleep;
 mod sync;
 mod worker;
@@ -104,9 +112,14 @@ pub use dedicated::{DedicatedThread, StopToken, ThreadConfig};
 pub use error::{ThreadingError, ThreadingResult};
 pub use graph::{GraphPanic, TaskGraph, TaskId};
 pub use job::{JobHandle, JobPanic};
+pub use observe::{
+    JobFinish, JobObserver, JobStart, JobSteal, PoolId, PoolStats, WorkerSleep, WorkerStats,
+    WorkerWake,
+};
 pub use platform::thread::ThreadPriority;
 pub use pool::{Spawner, ThreadPool};
 pub use priority::JobPriority;
 pub use role::{RoleGuard, ThreadRole, assert_main_thread, is_main_thread};
 pub use scope::Scope;
+pub use scratch::with_scratch;
 pub use worker::worker_index;

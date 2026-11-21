@@ -29,6 +29,12 @@ impl Drop for RunningJob {
     }
 }
 
+/// How many jobs (of any pool) the calling thread is running at this moment: 0 outside of jobs, more than 1
+/// while a job runs jobs inside itself (help while waiting).
+pub(crate) fn running_depth() -> usize {
+    RUNNING.with(|running| running.borrow().len())
+}
+
 /// Whether the calling thread is running a job of pool `pool` right now.
 ///
 /// After a pool has begun to shut down, only such a thread may still add work to it: the jobs a running job

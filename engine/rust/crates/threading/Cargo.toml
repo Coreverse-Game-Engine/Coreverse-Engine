@@ -1,6 +1,6 @@
 [package]
 name = "threading"
-description = "Coreverse's job system: a thread pool with job handles, panic propagation and a single-threaded mode (foundation milestone T1)"
+description = "Coreverse's job system: a thread pool with job handles, panic propagation and a single-threaded mode (see docs/src/threading.md for the milestones)"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 ccore = { path = "../ccore" }
+memory = { path = "../memory" }
 platform = { path = "../platform" }
 thiserror.workspace = true
 
