@@ -1,12 +1,14 @@
 [package]
 name = "reflection"
-description = "Placeholder for the engine's runtime type information; not yet implemented"
+description = "Coreverse's runtime type information (milestone R1): stable type keys, static type descriptions, the Reflect traits and reflection of the standard types; no unsafe code"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+ccore = { path = "../ccore" }
+utilities = { path = "../utilities" }
 
 [lints]
 workspace = true
