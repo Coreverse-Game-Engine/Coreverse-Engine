@@ -1,12 +1,26 @@
 [package]
 name = "event"
-description = "Placeholder for the engine's event and messaging infrastructure; not yet implemented"
+description = "Coreverse's event infrastructure: a typed publish/subscribe bus with priorities, RAII subscriptions, interceptors, cancellable events, one-shot handlers, a thread-safe event queue, parallel delivery on the job system, counters and slow-handler reports"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# `SlowHandler::to_diagnostic`: slow-handler reports as diagnostics of the logging core.
+logging = ["dep:log-core"]
+
 [dependencies]
+threading = { path = "../threading" }
+log-core = { path = "../log-core", optional = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "event_bench"
+harness = false
 
 [lints]
 workspace = true

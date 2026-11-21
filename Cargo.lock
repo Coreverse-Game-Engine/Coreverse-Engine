@@ -484,6 +484,11 @@ dependencies = [
 [[package]]
 name = "event"
 version = "0.1.0"
+dependencies = [
+ "criterion",
+ "log-core",
+ "threading",
+]
 
 [[package]]
 name = "fastrand"
@@ -1743,6 +1748,11 @@ dependencies = [
 [[package]]
 name = "threading"
 version = "0.1.0"
+dependencies = [
+ "ccore",
+ "platform",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "time"
