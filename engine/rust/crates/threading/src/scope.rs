@@ -37,6 +37,14 @@
 //!    fields of a by-value closure environment. The task closure therefore captures the [`ScopedTask`] behind a
 //!    `Box` (whose pointee is not retagged as part of the argument) and moves the job out onto its own stack
 //!    frame; the job's call returns, and its borrows end, strictly before the guard is dropped.
+//! 8. **A task that can be taken back stays accounted for.** [`Scope::spawn_claimable`] puts the erased task
+//!    (job and guard) into an `Arc<Mutex<Option<Task>>>` and queues a `'static` shell that takes the task out of
+//!    the cell and runs it. Whoever takes the task out first runs it (the shell, or the owner through
+//!    [`Claim::run_here`]); the other finds `None`. The guard travels with the task, so invariant 1 holds
+//!    unchanged: `pending` stays raised while the task is in the cell, and is lowered when the task has run or
+//!    has been dropped (the cell is dropped with its last `Arc`: the queued shell, or the claim). A shell that
+//!    is popped after the task is gone holds no borrowed data, so it may outlive the scope. No new `unsafe`
+//!    code: the lifetime is erased once, in [`erase_lifetime`], before the task goes into the cell.
 
 use std::any::Any;
 use std::fmt;
@@ -277,6 +285,54 @@ impl<'scope> Scope<'scope, '_> {
     where
         F: FnOnce() + Send + 'scope,
     {
+        let task = self.erased_task(job);
+
+        if let Err(task) = self.shared.submit(priority, task) {
+            // The pool is shutting down or has shut down and this thread is not running one of its jobs (only
+            // possible through a `Spawner` that outlived the pool), so the job cannot be queued: run it here.
+            // The scope's contract holds either way.
+            task();
+        }
+    }
+
+    /// Like [`spawn_with_priority`](Self::spawn_with_priority), but the owner can **take the job back** with
+    /// [`Claim::run_here`] if nobody has started it by then, and run it on its own thread.
+    ///
+    /// This is what [`join`](crate::parallel) is built on. A job that is taken back leaves behind in the queue
+    /// only an empty shell, and the scope does not have to wait for that shell: the job's guard is gone as soon
+    /// as the job has run, so `pending` is 0 without anybody popping the shell. Without it the owner would
+    /// wait, and help with whatever the queues offer (the oldest job, which is some enclosing split), nesting
+    /// work inside work: the stack depth then grows with the number of jobs instead of with the recursion.
+    pub(crate) fn spawn_claimable<F>(&'scope self, priority: JobPriority, job: F) -> Claim
+    where
+        F: FnOnce() + Send + 'scope,
+    {
+        // The erased task (job and guard) lives in a cell that holds only `'static` types, and the queue gets
+        // a `'static` shell that takes the task out of the cell when it runs. Whoever takes the task out first
+        // (the shell, or the owner through the claim) runs it; the other finds the cell empty and does nothing.
+        // The task is accounted for by its guard in either case (invariant 1), and the shell, which can
+        // outlive the scope, holds no borrowed data once the task is out of the cell.
+        let task = self.erased_task(job);
+        let cell: Arc<Mutex<Option<Task>>> = Arc::new(Mutex::new(Some(task)));
+        let queued = Arc::clone(&cell);
+        let shell: Task = Box::new(move || {
+            let task = lock(&queued).take();
+            if let Some(task) = task {
+                task();
+            }
+        });
+        if let Err(shell) = self.shared.submit(priority, shell) {
+            // The pool refuses the job (see `spawn_with_priority`): run it here.
+            shell();
+        }
+        Claim { cell }
+    }
+
+    /// Wraps `job` into a `'static` task that owns a guard of this scope (invariants 1 and 2).
+    fn erased_task<F>(&'scope self, job: F) -> Task
+    where
+        F: FnOnce() + Send + 'scope,
+    {
         // The task is boxed so that the closure below captures only a `Box`, not the job itself (invariant 7):
         // the job moves onto the stack inside the closure and is consumed by its call before the guard drops.
         let scoped = Box::new(ScopedTask {
@@ -294,12 +350,24 @@ impl<'scope> Scope<'scope, '_> {
         // SAFETY: the task owns a `ScopeGuard` of this scope, and `run_scope` does not return before every
         // such guard is dropped (invariants 1 and 3), so the task, and with it everything of lifetime
         // `'scope` that it holds, is dropped or finished before `'scope` ends.
-        let task = unsafe { erase_lifetime(task) };
+        unsafe { erase_lifetime(task) }
+    }
+}
 
-        if let Err(task) = self.shared.submit(priority, task) {
-            // The pool is shutting down or has shut down and this thread is not running one of its jobs (only
-            // possible through a `Spawner` that outlived the pool), so the job cannot be queued: run it here.
-            // The scope's contract holds either way.
+/// The owner's way back to a job queued with [`Scope::spawn_claimable`].
+///
+/// Dropping a claim does nothing: the job stays queued and runs when somebody pops it (a scope that unwinds
+/// before it takes the job back still has it run by the thread that waits for the scope).
+pub(crate) struct Claim {
+    cell: Arc<Mutex<Option<Task>>>,
+}
+
+impl Claim {
+    /// Runs the job on the calling thread if nobody has started it yet; does nothing if it has been started
+    /// (it is running, or done, on another thread).
+    pub(crate) fn run_here(self) {
+        let task = lock(&self.cell).take();
+        if let Some(task) = task {
             task();
         }
     }
@@ -410,6 +478,78 @@ mod tests {
 
     fn pool(workers: usize) -> ThreadPool {
         ThreadPool::new(PoolConfig::new().with_workers(WorkerCount::Exact(workers))).unwrap()
+    }
+
+    #[test]
+    fn a_claimed_job_runs_on_the_owner_and_the_scope_does_not_wait_for_the_shell() {
+        // No workers: nobody else can start the job, so the claim runs it here, and the scope is idle at once,
+        // although the queue still holds the empty shell.
+        let pool = pool(0);
+        let runs = AtomicUsize::new(0);
+        let (queued_after, pending_after) = run_scope(&pool.shared, |scope| {
+            let claim = scope.spawn_claimable(JobPriority::Normal, || {
+                runs.fetch_add(1, Ordering::SeqCst);
+            });
+            claim.run_here();
+            (pool.shared.has_queued(), scope.state.is_idle())
+        });
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert!(queued_after, "the shell is still queued");
+        assert!(pending_after, "but the scope does not count it");
+        // The shell is harmless: running it does nothing.
+        pool.run_pending();
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the job ran exactly once");
+    }
+
+    #[test]
+    fn a_job_that_somebody_else_started_is_not_run_again_by_the_claim() {
+        let pool = pool(0);
+        let runs = AtomicUsize::new(0);
+        run_scope(&pool.shared, |scope| {
+            let claim = scope.spawn_claimable(JobPriority::Normal, || {
+                runs.fetch_add(1, Ordering::SeqCst);
+            });
+            // Somebody pops the shell first (here: this thread, standing in for a worker or a helper).
+            assert!(pool.shared.run_one());
+            assert_eq!(runs.load(Ordering::SeqCst), 1);
+            claim.run_here();
+            assert_eq!(
+                runs.load(Ordering::SeqCst),
+                1,
+                "the claim found the cell empty"
+            );
+        });
+    }
+
+    #[test]
+    fn a_dropped_claim_leaves_the_job_to_the_scope() {
+        let pool = pool(0);
+        let runs = AtomicUsize::new(0);
+        run_scope(&pool.shared, |scope| {
+            drop(scope.spawn_claimable(JobPriority::Normal, || {
+                runs.fetch_add(1, Ordering::SeqCst);
+            }));
+            assert_eq!(runs.load(Ordering::SeqCst), 0, "not run yet");
+        });
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "the scope ran it before it returned"
+        );
+    }
+
+    #[test]
+    fn a_panic_in_a_claimed_job_is_reported_by_the_scope() {
+        let pool = pool(0);
+        let failure = panic::catch_unwind(AssertUnwindSafe(|| {
+            run_scope(&pool.shared, |scope| {
+                scope
+                    .spawn_claimable(JobPriority::Normal, || panic!("claimed"))
+                    .run_here();
+            });
+        }))
+        .unwrap_err();
+        assert_eq!(failure.downcast_ref::<&str>(), Some(&"claimed"));
     }
 
     #[test]

@@ -244,10 +244,9 @@ impl PoolStats {
     }
 }
 
-/// The live counters of one worker (or of the helpers). Only that worker writes most of them, so they sit on a
-/// cache line of their own.
+/// The live counters of one worker (or of the helpers). Only that worker writes most of them, so the pool keeps
+/// each set in a [`CachePadded`](utilities::CachePadded) of its own: two workers never share a cache line.
 #[derive(Default)]
-#[repr(align(64))]
 pub(crate) struct Counters {
     pub(crate) jobs: AtomicU64,
     pub(crate) steals: AtomicU64,
@@ -332,9 +331,16 @@ mod tests {
     }
 
     #[test]
-    fn counters_sit_on_their_own_cache_line() {
-        assert!(std::mem::align_of::<Counters>() >= 64);
-        assert_eq!(std::mem::size_of::<Counters>() % 64, 0);
+    fn padded_counters_sit_on_their_own_cache_lines() {
+        use utilities::CachePadded;
+        // Two neighbours in a `Vec` (how the pool stores them) never share a line, whichever line size the
+        // hardware has up to the 128 bytes that `CachePadded` pads to.
+        assert!(std::mem::align_of::<CachePadded<Counters>>() >= 128);
+        assert_eq!(std::mem::size_of::<CachePadded<Counters>>() % 128, 0);
+        let pair: Vec<CachePadded<Counters>> = (0..2).map(|_| CachePadded::default()).collect();
+        let first = std::ptr::from_ref(&*pair[0]) as usize;
+        let second = std::ptr::from_ref(&*pair[1]) as usize;
+        assert!(second.abs_diff(first) >= 128);
     }
 
     #[test]

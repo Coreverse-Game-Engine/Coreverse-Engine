@@ -1768,6 +1768,7 @@ name = "threading"
 version = "0.1.0"
 dependencies = [
  "ccore",
+ "criterion",
  "memory",
  "platform",
  "thiserror 2.0.21",

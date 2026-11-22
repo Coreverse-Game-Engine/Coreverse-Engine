@@ -2,9 +2,11 @@
 
 `engine/rust/crates/threading` is the engine's job system. It is being built in milestones; this page describes what
 exists (T1 foundation, T2 queues/priorities/spawners, T3 scoped jobs and parallel loops, T4 dependencies and task
-graphs, T5 dedicated threads, roles and the IO pool, T6 observation and scratch memory) and what is planned. The crate uses `std` only and has one `unsafe` block (see "Scoped jobs" below); everything
-added in T4, T5 and T6 is safe code on top of it. The crate depends on `ccore`, `platform`, `memory` (T6: the scratch
-arenas) and `thiserror`.
+graphs, T5 dedicated threads, roles and the IO pool, T6 observation and scratch memory; T7 added the benchmarks and the
+verification described at the end of this page) and what is planned. The crate uses `std` only and has one `unsafe` block
+(see "Scoped jobs" below); everything added in T4, T5 and T6 is safe code on top of it. The crate depends on `ccore`,
+`platform`, `memory` (T6: the scratch arenas), `utilities` (the poison-tolerant `lock` and `into_inner`, and `CachePadded` for
+the per-worker statistics) and `thiserror`.
 
 ## What is there (T1 to T6)
 
@@ -127,7 +129,7 @@ pool.parallel_for(0..1_000, |i| {
   single-threaded builds use it because it is deterministic.
 * **No lock is held while job code runs.** The crate's mutexes only guard a few lines of its own queue and slot
   code, so what a job does inside its closure cannot deadlock the pool through them. Poisoned locks are taken back
-  instead of propagating a panic (`utilities::sync::lock`).
+  instead of propagating a panic.
 * **Closures are `Send + 'static`.** Jobs that borrow from the caller's stack need scoped jobs (T3) or a task graph (T4).
 
 ## Scoped jobs, `join` and the parallel loops (T3)
@@ -139,9 +141,18 @@ pool.parallel_for(0..1_000, |i| {
   borrows (a `&mut` element, an atomic, a `Mutex`) or use `join`.
 * **Panics.** A panicking job does not stop the others. When all are done, the scope re-raises the first job panic.
   If the body itself panics, the jobs are still waited for first and the body's panic wins. Nothing is cancelled.
-* **`join(a, b)`.** `a` runs on the calling thread, `b` as a scoped job. Because a job spawned by a job on a worker
-  goes into that worker's own queue and the worker takes its newest job back first, an unstolen `b` is simply run by
-  the caller after `a`: a `join` that nobody helps costs little more than a function call and an allocation.
+* **`join(a, b)`.** `a` runs on the calling thread, `b` is queued as a scoped job that another thread may steal while
+  `a` runs. When `a` is done and nobody has started `b`, **the caller takes `b` back and runs it itself** (a `Claim`
+  on the queued job: whoever takes the task out of its cell first runs it). So a `join` that nobody steals costs little
+  more than two function calls, an allocation and a few locks, and the work stays depth-first, like a sequential
+  recursion: the caller waits, and helps with other jobs, only when `b` really is running on another thread.
+  *Why this matters:* the first version left the taking-back to help-while-waiting, which is correct for a worker (its
+  own queue gives its newest job first) but not for a thread outside the pool, whose help comes from the shared
+  first-in-first-out queue, that is the *oldest* job, the biggest piece of some enclosing split. Running it inside the
+  wait nested a new round of splits inside the old one, and the stack depth grew with the number of pieces. The T7
+  benchmarks found it: `parallel_chunks` over about a million items in chunks of 16 overflowed the stack of the
+  calling thread, and so did a user's recursive `join` (a plain `fib(20)`) on a 512 KiB stack. `tests/stack_depth.rs`
+  runs the loops and a recursive `join` on such a small stack.
 * **Loops.** `parallel_for`, `parallel_for_each` and `parallel_for_each_mut` cut the work into about four chunks per
   thread. `parallel_chunks` and `parallel_chunks_mut` use the chunk size you give, with the boundaries of
   `slice::chunks` (the last chunk may be shorter), no matter how the work is scheduled; `parallel_chunks_mut` passes the
@@ -168,7 +179,11 @@ the scope never lets the borrowed data go while a job can still touch it:
    `Box` and moves it onto its own stack frame, so that no reference hidden in a by-value closure environment is still
    a protected function argument (in Miri's Stacked Borrows model) when the counter reaches 0 and the caller reads what
    the job wrote through its `&mut`. Without the `Box`, Miri reported this as undefined behaviour even though no data
-   race existed; `scope.rs` has a regression test for it.
+   race existed; `scope.rs` has a regression test for it;
+7. a job that its owner can take back (the `join` above) sits, already erased, in a cell of `'static` types, and a
+   `'static` shell queued for the pool takes it out of the cell and runs it. Whoever takes it out first runs it. The
+   guard travels with the task, so the counting argument (1) is unchanged, and a shell that is popped after the scope is
+   gone is empty: it holds nothing borrowed. No new `unsafe` code.
 
 The compiler rejects the misuse cases (a job borrowing something that dies with the body, a `&Scope` escaping,
 two jobs borrowing the same variable mutably, reading what a job may change, capturing a non-`Send` value, using a
@@ -397,7 +412,7 @@ workers did for the pool: waiting threads, the thread that shuts the pool down, 
 | `busy`, `slept` | time running jobs (nested jobs count once, with the outermost) and time asleep; **zero unless timing is on** (`with_timing(true)` or an observer) |
 | `scratch_frames`, `scratch_peak` | frames the worker's scratch arena has been through, and the most bytes it used in one |
 
-Counters only grow; read twice and subtract for a frame. They are relaxed atomics, each worker's on a cache line of its own, so
+Counters only grow; read twice and subtract for a frame. They are relaxed atomics, each worker's set in a `utilities::CachePadded` of its own (128 bytes, so two workers never share a cache line), so
 a snapshot taken under load is not a consistent cut (a job may be counted as run and not yet as stolen) but is exact once
 the pool is idle. Without timing and without an observer a job costs a few relaxed additions; with either, two clock reads.
 
@@ -437,6 +452,98 @@ pool.begin_scratch_frame();
   growing arenas (a full arena returns the `MemoryError` of `memory`, so size it for the frame's peak: `scratch_peak` tells
   how much a frame used), and arenas for threads that are not workers.
 
+## Benchmarks (T7)
+
+`cargo bench -p threading` runs the criterion suite in `benches/threading_bench.rs` (a few minutes; add
+`--bench threading_bench -- --quick` for a fast, rough pass, or a filter such as `-- parallel_for` for one group). Like the
+other suites it is run by hand or by the manual `Benchmarks` workflow, never as a gate: numbers from shared runners are too
+noisy. Worker counts are 1, 2, 4, ... up to the machine's logical cores, so every group has as many rows as the machine
+has doublings.
+
+| Group | What it measures |
+|:--|:--|
+| `job_overhead` | One job in single-threaded mode against a thread per job (`std::thread::spawn` + `join`); a batch of 1000 empty jobs with no workers (plain, with timing on, with a no-op observer) and with 1, 2, 4, ... workers. |
+| `parallel_for` | A body of about 40 ns over 2^20 items: the plain loop, then `parallel_chunks` (chunks of 4096) and `parallel_for_each_mut` with no workers and with 1, 2, 4, ... workers. This is the scaling group. |
+| `parallel_for_granularity` | A one-addition body over 2^20 items with chunks of 16, 256, 4096 and 65 536 on the largest pool: what a chunk costs to schedule. |
+| `queue_contention` | 10 000 jobs born on one worker (the others must steal them) and 10 000 jobs pushed by 4 outside threads into the shared queue. |
+| `dependencies` | A chain of 1000 `then` continuations, a `TaskGraph` that is a chain of 1000 tasks, and a graph of 10 layers of 100 tasks (each task waits for two of the layer before), with no workers and on the largest pool. |
+| `scratch_memory` | 1000 jobs that each need 1 KiB of temporary data, from the worker's arena against `Vec`; and the price of `with_scratch` itself on a worker. |
+| `statistics` | Taking a `PoolStats` snapshot. |
+
+**How to read them.** Read ratios between rows of one run, not absolute figures. `no_workers` is the single-threaded
+mode: the benchmark thread runs the jobs itself, so the figure is the cost of the queue, the handle and the bookkeeping
+without a thread hand-off. A thread that waits for a handle helps (it may run the job itself), so with workers the
+round trip of a single job is not a thread-to-thread latency; `scratch_memory` and `queue_contention` wait on a channel
+instead so that the benchmark thread does not take part.
+
+**One run, for orientation.** The development sandbox has **one logical core**, shared and noisy (criterion reported
+changes of 5-25 % between consecutive runs of the same code), Rust 1.100.0, `--quick`. These rows say what things cost in
+order of magnitude and where the time goes; they say **nothing about scaling**, which needs a machine with cores
+(run the `parallel_for` and `queue_contention` groups there and keep the table next to your hardware).
+
+| Benchmark (1 core, `--quick`) | Time | Per job / item |
+|:--|--:|--:|
+| one job, single-threaded mode (spawn + wait) | 0.23-0.30 µs | |
+| one thread per job (spawn + join), for comparison | 11-12 µs | about 40 times more |
+| 1000 jobs, no workers, plain | 0.34 ms | 0.34 µs |
+| the same with timing on (or an observer installed) | 0.50 ms | 0.50 µs (about 0.16 µs for the two clock reads) |
+| 1000 jobs, 1 worker (hand-offs between two threads on one core) | 1.0-1.2 ms | about 1 µs |
+| `parallel_chunks` (chunks of 4096), 2^20 items of 40 ns, no workers / the plain loop | 30 ms / 30-36 ms | no measurable overhead |
+| the same with 1 worker (one core: no gain is possible) | 33 ms | within about 10 % of the loop |
+| scheduling a chunk (tiny body, 1 worker): chunks of 16 / 256 / 4096 | 31.7 ms / 2.6 ms / 0.48 ms | about 0.5 µs per chunk |
+| 10 000 jobs born on one worker, 1 worker / 4 outside producers | 4.1 ms / 4.5 ms | about 0.4 µs |
+| `then` chain of 1000, no workers / 1 worker | 0.22 ms / 0.80 ms | 0.22 µs / 0.8 µs per link |
+| `TaskGraph` chain of 1000 tasks, no workers / 1 worker | 0.14 ms / 0.16 ms | about 0.15 µs per task |
+| `TaskGraph` 10 x 100 layers, no workers / 1 worker | 0.15 ms / 0.43 ms | 0.15 µs / 0.43 µs per task |
+| 1000 jobs with 1 KiB of temporary data: scratch arena / `Vec` | 0.49 ms / 0.45 ms | no difference at this size |
+| `with_scratch` on a worker (thread-local lookup and `Rc` clone) | 1.4 ns | |
+| `ThreadPool::stats()` snapshot, 1 worker | 24 ns | |
+
+What these numbers suggest (to be confirmed on a machine with cores):
+
+* A job costs a few hundred nanoseconds of scheduling. A chunk of a parallel loop should be worth tens of microseconds of
+  work, or the loop is mostly scheduling: that is why the automatic chunk size aims at four chunks per thread, and why
+  `parallel_chunks` documents that "a chunk is worth a job".
+* **Timing is not free** relative to a job this small: the two clock reads add about as much as the whole queue round
+  trip. The statistics counters themselves cannot be switched off, so their share is inside the "plain" figure; the
+  design keeps them to a few relaxed additions on a cache line of the worker's own, and the benchmarks do not suggest
+  they matter next to the rest.
+* **The scratch arena is not a speed-up at this size**: a 1 KiB `Vec` is cheap and the job is dominated by scheduling.
+  What it gives is predictable memory (a fixed budget under a `MemoryTag`, no allocator calls on the hot path) and freeing
+  a whole frame at once; measure with your own allocation pattern before counting on speed.
+* Dependencies cost about what a job costs: the graph machinery adds no visible overhead per task over the queue.
+
+**What the benchmarks found.** Writing the granularity group made `parallel_chunks` over about a million items in chunks
+of 16 abort with a stack overflow. That was a real bug in the T3 `join` (see "Scoped jobs, `join` and the parallel
+loops"), fixed in T7 with a regression test. A benchmark that exercises the extremes is part of what T7 is for.
+
+## Verification
+
+What is checked, and how, so that it is clear what a green run means:
+
+* **Tests.** Unit tests next to the code, and one integration test file per area (`pool`, `scheduling`, `scoped`,
+  `graph`, `threads`, `observe`, `scratch_tag`, `stack_depth`), plus doc tests, including `compile_fail` tests that
+  pin the lifetime rules of scopes. Behaviour tests run on pools of 0, 1, 3 and 8 workers.
+* **Repeated native runs.** Threads interleave differently on every run, so the concurrent targets are run many times in
+  a row, in debug and in release, also pinned to a single core (`taskset -c 0`), which changes the interleavings a lot.
+  They find logic races and deadlocks, which Miri does not.
+* **Miri** (the commands in "Running Miri") checks the `unsafe` block and everything the tests execute for undefined
+  behaviour: aliasing, lifetimes, data races on non-atomic data. A manual workflow runs it in CI. The tests scale their
+  workload down under Miri, and the same scaled-down paths are also run natively with `RUSTFLAGS="--cfg miri"`, so a test
+  that is too slow or wrong under Miri is found without Miri.
+* **Lints and documentation.** `cargo clippy -p threading --all-targets -- -D warnings`, `cargo fmt --all -- --check`,
+  and `RUSTDOCFLAGS="-D warnings" cargo doc -p threading --no-deps`.
+* **Not done on purpose: `loom`.** `loom` explores the interleavings of a *model* of the synchronization, and it needs
+  the crate to use `loom`'s types instead of `std`'s (a facade over `Mutex`, `Condvar`, atomics, thread-locals and
+  `thread::spawn` in all sixteen source modules and in every test file that touches a lock). The cost is high and what it would check is already
+  covered where the risk is: the only `unsafe` block is a lifetime erasure whose argument is about counting under a mutex,
+  which Miri's data-race and aliasing checks test directly, and the wake-up protocols (`Sleep`, the scratch frame
+  announcement, the continuation slots) are plain mutex-and-condvar code that the repeated runs and the regression tests
+  exercise. It becomes the right tool when a lock-free queue replaces the mutex deque, which is also the point where
+  "not planned for now" in the roadmap is reconsidered.
+* **Not covered.** Windows and macOS runs of the repeated tests, ThreadSanitizer, and the effect of a real OS scheduler on
+  thread priorities (the priority requests are only checked not to break anything).
+
 ## Running Miri
 
 Miri checks the `unsafe` block in `scope.rs` (and everything else the tests execute) for undefined behaviour. It needs
@@ -452,8 +559,14 @@ cargo +nightly miri test -p threading --test graph
 cargo +nightly miri test -p threading --test threads
 cargo +nightly miri test -p threading --test observe
 cargo +nightly miri test -p threading --test scratch_tag
+cargo +nightly miri test -p threading --test stack_depth
 cargo +nightly miri test -p threading --doc
 ```
+
+The same runs are available as a **manual GitHub workflow** (`Miri`, `.github/workflows/miri.yml`, `workflow_dispatch`
+only): choose the crate, optionally one test target (`--lib`, `--test scoped`, ...) and a number of seeds. It is not part
+of the automatic CI, for the reason the benchmarks are not: it is slow and a full run is not worth gating every push on; run
+it before merging a change to `scope.rs` or to the code that runs jobs.
 
 * The tests scale their workload down under Miri (`scaled(normal, under_miri)` in each test file; the behaviour tested is
   the same, only the amount of work changes).
@@ -478,7 +591,7 @@ cargo +nightly miri test -p threading --doc
 | T4        | Done: `JobHandle::then`, `when_all` (counter-based dependencies) and `TaskGraph` with cycle detection when it is built, run with a counter per task; for the ECS scheduler. |
 | T5        | Done: `DedicatedThread` with `ThreadConfig` and `StopToken`, `ThreadRole` with the main-thread marker and assertions, the `PoolConfig::io()` preset, `JobHandle::then_on` to move work between pools. |
 | T6        | Done: `JobObserver` hooks (`PoolConfig::with_observer`), `PoolStats` per worker, per-worker `FrameArena` scratch registered with a `MemoryTag` (`with_scratch`, `begin_scratch_frame`). |
-| T7        | criterion benchmarks, the rest of the documentation, an optional Miri/loom job (the `scope` module is what it is for).                              |
+| T7        | Done: criterion benchmarks (`benches/threading_bench.rs`), this page and the status rows finished, a manual Miri workflow, and the stack-depth fix and `Claim` the benchmarks led to. |
 
 Not planned for now: an `async` executor, fibers, `no_std`, an FFI for C++ (it comes when C++ needs to submit jobs,
 for example for a render thread), a lock-free queue (only if measurements ask for it). The queues live in one module (`queue.rs`) behind a small

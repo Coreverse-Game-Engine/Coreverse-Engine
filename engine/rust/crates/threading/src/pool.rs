@@ -8,6 +8,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use memory::FrameArena;
+use utilities::CachePadded;
 
 use platform::thread::ThreadPriority;
 
@@ -44,9 +45,9 @@ pub(crate) struct Shared {
     /// Numbers the jobs for the observer, in the order they start.
     next_job: AtomicU64,
     /// What each worker did, by worker index.
-    counters: Vec<Counters>,
+    counters: Vec<CachePadded<Counters>>,
     /// What all the threads that are not workers of this pool did for it.
-    helpers: Counters,
+    helpers: CachePadded<Counters>,
     /// The size of each worker's scratch arena in bytes; 0 when there is none.
     scratch_capacity: usize,
     /// Raised by [`ThreadPool::begin_scratch_frame`]; every worker resets its arena when it sees a new value.
@@ -65,8 +66,8 @@ impl Shared {
             timing: config.timing() || observer.is_some(),
             observer,
             next_job: AtomicU64::new(0),
-            counters: (0..workers).map(|_| Counters::default()).collect(),
-            helpers: Counters::default(),
+            counters: (0..workers).map(|_| CachePadded::default()).collect(),
+            helpers: CachePadded::default(),
             scratch_capacity: config.scratch_capacity().unwrap_or(0),
             scratch_epoch: AtomicU64::new(0),
         }
@@ -95,7 +96,11 @@ impl Shared {
 
     fn stats(&self) -> PoolStats {
         PoolStats {
-            workers: self.counters.iter().map(Counters::snapshot).collect(),
+            workers: self
+                .counters
+                .iter()
+                .map(|counters| counters.snapshot())
+                .collect(),
             helpers: self.helpers.snapshot(),
             scratch_capacity: self.scratch_capacity,
         }
