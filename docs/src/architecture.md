@@ -23,6 +23,12 @@ engine/
 * **Rust core** owns things that benefit from memory safety and testing: the virtual file system, logging,
   filesystem helpers, math, and the operating-system abstraction (`platform`: system info, clocks and timers,
   standard directories, process and thread helpers; see [Platform layer](platform.md)).
+* **Rust engine systems** build on the core: `memory` (aligned layouts, arenas, pools and tagged memory tracking, with a C++
+  interface; see [Memory](memory.md)), `threading` (the job system: a thread pool with work stealing and
+  priorities, scoped jobs and parallel loops, continuations and task graphs, dedicated threads with roles, an IO pool
+  preset, observer hooks and per-worker scratch arenas taken from `memory`; see [Threading](threading.md)) and `event`
+  (a typed publish/subscribe bus whose handlers can be delivered as jobs on the `threading` pool); the last two have no FFI
+  surface yet. A pool is an explicit object owned by the runtime; there is no global pool.
 * **`ffi`** is a C ABI over the Rust core (`cbindgen` generates `ffi.h`; Corrosion builds and links the static
   library from CMake). It exposes logging, the VFS, build info, and platform information and directories; the other
   Rust crates are not exposed to C++.

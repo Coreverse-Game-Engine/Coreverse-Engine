@@ -1422,6 +1422,21 @@ dependencies = [
 [[package]]
 name = "reflection"
 version = "0.1.0"
+dependencies = [
+ "ccore",
+ "inventory",
+ "reflection-macros",
+ "utilities",
+]
+
+[[package]]
+name = "reflection-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
+]
 
 [[package]]
 name = "regex"
@@ -1753,6 +1768,7 @@ name = "threading"
 version = "0.1.0"
 dependencies = [
  "ccore",
+ "criterion",
  "memory",
  "platform",
  "thiserror 2.0.21",

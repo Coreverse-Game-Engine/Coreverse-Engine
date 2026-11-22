@@ -13,5 +13,12 @@ platform = { path = "../platform" }
 thiserror.workspace = true
 utilities = { path = "../utilities" }
 
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "threading_bench"
+harness = false
+
 [lints]
 workspace = true

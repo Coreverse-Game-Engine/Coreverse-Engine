@@ -1,14 +1,16 @@
 //! `scope`, `join` and the parallel loops, on top of [`scope::run_scope`](crate::scope).
 //!
 //! Everything here is safe code. The loops split their range (or slice) in halves with [`join`]: one half runs
-//! on the calling thread, the other is queued and, if nobody steals it, taken back by the caller while it waits
-//! (the caller's own queue gives its newest job first, which is exactly that half). Chunk boundaries are fixed
-//! by the chunk size the caller passes, like `slice::chunks`, not by how the work happens to be split.
+//! on the calling thread, the other is queued and, if nobody has started it when the first half is done, taken
+//! back and run by the caller itself (see [`join`] for why that must not be left to "help while waiting").
+//! Chunk boundaries are fixed by the chunk size the caller passes, like `slice::chunks`, not by how the work
+//! happens to be split.
 
 use std::ops::Range;
 use std::sync::Arc;
 
 use crate::pool::{Shared, Spawner, ThreadPool};
+use crate::priority::JobPriority;
 use crate::scope::{Scope, run_scope};
 
 /// How many chunks per thread the automatic chunk size aims for: enough that a slow chunk does not leave the
@@ -25,6 +27,14 @@ fn auto_chunk_size(len: usize, workers: usize) -> usize {
 }
 
 /// Runs `a` on this thread and `b` as a scoped job, and returns both results.
+///
+/// `b` is queued so that another thread can steal it while `a` runs. If nobody has started it by the time `a`
+/// is done, this thread takes it back and runs it itself ([`Claim::run_here`](crate::scope)). That is what keeps
+/// the stack shallow: the work stays depth-first, as in a sequential recursion, and a thread waits (and helps)
+/// only when `b` really is running on another thread. Leaving it to "help while waiting" overflowed the stack of
+/// a caller that was not a worker (a million items in chunks of 16): the oldest queued job is the biggest piece
+/// of some enclosing split, and running it inside this wait nests another round of splits inside this one, so
+/// the depth grew with the number of pieces instead of with the depth of the recursion.
 pub(crate) fn join<A, B, RA, RB>(shared: &Arc<Shared>, a: A, b: B) -> (RA, RB)
 where
     A: FnOnce() -> RA + Send,
@@ -34,8 +44,12 @@ where
 {
     let mut b_result: Option<RB> = None;
     let a_result = run_scope(shared, |scope| {
-        scope.spawn(|| b_result = Some(b()));
-        a()
+        let claim = scope.spawn_claimable(JobPriority::Normal, || b_result = Some(b()));
+        // If `a` panics we do not get here: the panic leaves the scope body, the scope waits for the queued
+        // job (which then runs `b`) and re-raises the panic, so `b` always runs to the end, as before.
+        let a_result = a();
+        claim.run_here();
+        a_result
     });
     match b_result {
         Some(b_result) => (a_result, b_result),

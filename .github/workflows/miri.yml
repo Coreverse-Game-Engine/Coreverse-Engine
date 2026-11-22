@@ -1,0 +1,56 @@
+name: Miri
+
+# Manual only, like the benchmarks: Miri runs the code in an interpreter, hundreds of times slower than native,
+# so a full `threading` run takes a long time and is not worth gating every push on. Run it before merging a
+# change to `engine/rust/crates/threading/src/scope.rs` (the crate's only `unsafe` block) or to the code that
+# runs jobs, and when a race is suspected.
+#
+# Pick the crate and, to keep a run short, one test target at a time, for example `--lib`, `--test scoped` or
+# `--doc`. `seeds` explores more thread interleavings (`-Zmiri-many-seeds=0..N`), at N times the cost.
+# There is deliberately no `loom` job: see "Verification" in docs/src/threading.md.
+on:
+    workflow_dispatch:
+        inputs:
+            package:
+                description: Crate to check
+                default: threading
+                type: string
+            args:
+                description: Extra arguments for `cargo miri test` (for example `--lib` or `--test scoped`)
+                default: ''
+                type: string
+            seeds:
+                description: Number of seeds to try (0 or 1 = the default single run)
+                default: '0'
+                type: string
+
+permissions:
+    contents: read
+
+jobs:
+    miri:
+        runs-on: ubuntu-24.04
+        timeout-minutes: 180
+
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+            - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+              with:
+                  toolchain: nightly
+                  components: miri
+
+            - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+            # The inputs go through the environment, not into the script text.
+            - name: cargo miri test
+              env:
+                  PACKAGE: ${{ inputs.package }}
+                  EXTRA_ARGS: ${{ inputs.args }}
+                  SEEDS: ${{ inputs.seeds }}
+              run: |
+                  if [ "$SEEDS" -gt 1 ]; then
+                      export MIRIFLAGS="-Zmiri-many-seeds=0..$SEEDS"
+                  fi
+                  # EXTRA_ARGS is split into words on purpose (`--test scoped`).
+                  cargo miri test -p "$PACKAGE" $EXTRA_ARGS
