@@ -1,12 +1,15 @@
 //! Parsing of the `#[reflect(...)]` attributes.
 
-use syn::{Attribute, LitStr, Result};
+use syn::{Attribute, LitStr, Path, Result};
 
 /// `#[reflect(...)]` on the type.
 #[derive(Default)]
 pub(crate) struct ContainerAttrs {
     pub(crate) name: Option<LitStr>,
     pub(crate) aliases: Vec<LitStr>,
+    /// Type data to register: `Default`, `Clone`, `PartialEq`, `Debug`, `Hash` or the path of a type that
+    /// implements `FromType`.
+    pub(crate) data: Vec<Path>,
 }
 
 /// `#[reflect(...)]` on a field.
@@ -49,9 +52,17 @@ pub(crate) fn container(attrs: &[Attribute]) -> Result<ContainerAttrs> {
             } else if meta.path.is_ident("alias") {
                 out.aliases.push(string_value!(meta));
                 Ok(())
+            } else if meta
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident.to_string().starts_with(char::is_uppercase))
+            {
+                out.data.push(meta.path.clone());
+                Ok(())
             } else {
                 Err(meta.error(
-                    "unsupported `reflect` attribute on a type; expected `name = \"...\"` or `alias = \"...\"`",
+                    "unsupported `reflect` attribute on a type; expected `name = \"...\"`, `alias = \"...\"` or the name of a type data (`Default`, `Clone`, `PartialEq`, `Debug`, `Hash`, or a type that implements `FromType`)",
                 ))
             }
         })?;

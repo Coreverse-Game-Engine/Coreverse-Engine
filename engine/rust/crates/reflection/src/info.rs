@@ -10,12 +10,14 @@ use std::fmt;
 
 use crate::key::TypeKey;
 use crate::reflect::{ReflectKind, Typed};
+use crate::registry::TypeRegistration;
 
 /// A lazy reference to the description of another type.
 #[derive(Clone, Copy)]
 pub struct TypeRef {
     std_id: TypeId,
     info: fn() -> &'static TypeInfo,
+    registration: fn() -> TypeRegistration,
 }
 
 impl TypeRef {
@@ -24,12 +26,19 @@ impl TypeRef {
         Self {
             std_id: TypeId::of::<T>(),
             info: T::static_type_info,
+            registration: TypeRegistration::of::<T>,
         }
     }
 
     /// The description of the referenced type (built on first use).
     pub fn info(&self) -> &'static TypeInfo {
         (self.info)()
+    }
+
+    /// A new registration of the referenced type: its description and its type data. The registry uses it to
+    /// register the types a registered type is made of.
+    pub fn registration(&self) -> TypeRegistration {
+        (self.registration)()
     }
 
     /// The standard `TypeId` of the referenced type; it does not build the description.
@@ -660,6 +669,26 @@ impl TypeInfo {
             Self::Map(_) => ReflectKind::Map,
             Self::Set(_) => ReflectKind::Set,
             Self::Opaque(_) => ReflectKind::Opaque,
+        }
+    }
+
+    /// The types this type is made of: the types of its fields, of the fields of its variants, its item type
+    /// or its key and value types. Empty for opaque values. A type that contains itself lists itself.
+    pub fn dependencies(&self) -> Vec<TypeRef> {
+        match self {
+            Self::Struct(info) => info.fields().iter().map(FieldInfo::ty).collect(),
+            Self::TupleStruct(info) => info.fields().iter().map(FieldInfo::ty).collect(),
+            Self::Tuple(info) => info.fields().iter().map(FieldInfo::ty).collect(),
+            Self::Enum(info) => info
+                .variants()
+                .iter()
+                .flat_map(|variant| variant.fields().iter().map(FieldInfo::ty))
+                .collect(),
+            Self::List(info) => vec![info.item()],
+            Self::Array(info) => vec![info.item()],
+            Self::Map(info) => vec![info.key_type(), info.value_type()],
+            Self::Set(info) => vec![info.item()],
+            Self::Opaque(_) => Vec::new(),
         }
     }
 

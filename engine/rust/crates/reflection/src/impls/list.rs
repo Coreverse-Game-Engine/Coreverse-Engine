@@ -5,6 +5,8 @@ use crate::error::ReflectError;
 use crate::info::{ArrayInfo, ListInfo, TypeInfo, TypeRef};
 use crate::key::TypeKey;
 use crate::reflect::{Array, List, Reflect, ReflectIter, ReflectMut, ReflectRef, Typed};
+use crate::registry::TypeRegistration;
+use crate::type_data::{FromType, ReflectDefault};
 
 impl<T: Typed> Typed for Vec<T> {
     fn static_type_info() -> &'static TypeInfo {
@@ -13,6 +15,10 @@ impl<T: Typed> Typed for Vec<T> {
             let key = TypeKey::from_owned(&format!("Vec<{}>", T::static_type_info().path()));
             TypeInfo::List(ListInfo::new::<Self>(key, TypeRef::of::<T>()))
         })
+    }
+
+    fn register_type_data(registration: &mut TypeRegistration) {
+        registration.insert_data(<ReflectDefault as FromType<Self>>::from_type());
     }
 }
 

@@ -28,6 +28,13 @@ mod expand;
 /// * `name = "game::Player"`: the path of the type (for a generic type, the part before the arguments).
 /// * `alias = "game::OldPlayer"`: another path the type was known by; repeat it for several. Not allowed on
 ///   generic types.
+/// * `Default`, `Clone`, `PartialEq`, `Debug`, `Hash`: store `ReflectDefault`, `ReflectClone`,
+///   `ReflectPartialEq`, `ReflectDebug` or `ReflectHash` in the type's registration (the type has to
+///   implement the trait). Any other name that starts with an uppercase letter is a type data of your own: the
+///   macro calls `<Name as FromType<Type>>::from_type()`. Not allowed on generic types.
+///
+/// Every non-generic type also submits a `TypeEntry` to `inventory`, which `TypeRegistry::from_inventory`
+/// collects.
 ///
 /// On a field:
 ///

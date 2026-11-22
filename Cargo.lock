@@ -1424,6 +1424,7 @@ name = "reflection"
 version = "0.1.0"
 dependencies = [
  "ccore",
+ "inventory",
  "reflection-macros",
  "utilities",
 ]

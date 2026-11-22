@@ -4,6 +4,8 @@ use crate::cell::GenericTypeInfoCell;
 use crate::info::{EnumInfo, FieldInfo, TypeInfo, TypeRef, VariantInfo, VariantKind};
 use crate::key::TypeKey;
 use crate::reflect::{Enum, Reflect, ReflectMut, ReflectRef, Typed};
+use crate::registry::TypeRegistration;
+use crate::type_data::{FromType, ReflectDefault};
 
 impl<T: Typed> Typed for Option<T> {
     fn static_type_info() -> &'static TypeInfo {
@@ -18,6 +20,10 @@ impl<T: Typed> Typed for Option<T> {
                 ],
             ))
         })
+    }
+
+    fn register_type_data(registration: &mut TypeRegistration) {
+        registration.insert_data(<ReflectDefault as FromType<Self>>::from_type());
     }
 }
 

@@ -1,8 +1,9 @@
 //! `reflection` — runtime type information for the Coreverse Engine: what a type is and what it is made
 //! of, and a way to read and change values without knowing their type at compile time.
 //!
-//! The crate is built in milestones (see `docs/src/reflection.md`). This is **R2**: the core model (R1) and
-//! `#[derive(Reflect)]`. There is no registry yet (R3), no paths or dynamic values (R4).
+//! The crate is built in milestones (see `docs/src/reflection.md`). This is **R3**: the core model (R1),
+//! `#[derive(Reflect)]` (R2), the type registry and type data (R3). There are no paths or dynamic values yet
+//! (R4).
 //!
 //! # What is here today
 //!
@@ -24,6 +25,12 @@
 //! * `#[derive(Reflect)]` (from the `reflection-macros` crate, re-exported here as `Reflect`, next to the
 //!   trait): writes `Typed`, `Reflect` and the trait of the kind for structs, tuple structs, unit structs and
 //!   enums, generic ones included. See the attributes below.
+//! * [`TypeRegistry`]: the types a program knows, found by `TypeId`, path, alias or hash, with their
+//!   [`TypeRegistration`]s; filled by hand with [`register`](TypeRegistry::register) or from every derived
+//!   non-generic type with [`TypeRegistry::from_inventory`].
+//! * Type data ([`ReflectDefault`], [`ReflectClone`], [`ReflectPartialEq`], [`ReflectDebug`],
+//!   [`ReflectHash`], or your own through [`FromType`]): function tables that let code holding only a
+//!   `&dyn Reflect` or a type name use `Default`, `Clone`, `PartialEq`, `Debug` and `Hash`.
 //! * [`impl_reflect_boilerplate!`], [`TypeInfoCell`] and [`GenericTypeInfoCell`]: what an implementation
 //!   written by hand needs; the derive uses all three.
 //!
@@ -83,6 +90,33 @@
 //! variants: `rename`, `alias`. Generic types get a `Typed` bound per type parameter and a path that contains
 //! the paths of the arguments; lifetime parameters, unions and enums without variants are errors.
 //!
+//! # The registry
+//!
+//! `#[reflect(Default, Clone, PartialEq, Debug, Hash)]` on a type stores the matching type data in its
+//! registration (any other uppercase name is a type data of your own: `<Name as FromType<Type>>::from_type()`
+//! is called; not allowed on generic types, use [`TypeRegistry::add_type_data`] there). The standard types
+//! come with the data of the traits they implement.
+//!
+//! ```
+//! use reflection::{Reflect, TypeRegistry};
+//!
+//! #[derive(Reflect, Default, Debug, PartialEq)]
+//! #[reflect(Default)]
+//! struct Settings {
+//!     volume: u32,
+//! }
+//!
+//! let mut registry = TypeRegistry::new();
+//! registry.register::<Settings>().unwrap();
+//! let path = registry.get_by_type::<Settings>().unwrap().path();
+//! let value = registry.create_default(path).unwrap();
+//! assert_eq!(value.downcast_ref::<Settings>(), Some(&Settings { volume: 0 }));
+//! ```
+//!
+//! Registering a type registers the types it is made of; two different types may not share a path or an
+//! alias ([`ReflectError::NameConflict`]). Every non-generic derived type also submits itself to
+//! `inventory`, so `TypeRegistry::from_inventory()` finds all of them without a list.
+//!
 //! Wrong uses fail to compile:
 //!
 //! ```compile_fail
@@ -130,6 +164,8 @@ mod impls;
 mod info;
 mod key;
 mod reflect;
+mod registry;
+mod type_data;
 
 pub use cell::{GenericTypeInfoCell, TypeInfoCell};
 pub use error::ReflectError;
@@ -143,3 +179,15 @@ pub use reflect::{
     Tuple, TupleStruct, Typed,
 };
 pub use reflection_macros::Reflect;
+pub use registry::{TypeRegistration, TypeRegistry};
+pub use type_data::{
+    DebugValue, FromType, ReflectClone, ReflectDebug, ReflectDefault, ReflectHash,
+    ReflectPartialEq, TypeData,
+};
+
+/// What the code written by `#[derive(Reflect)]` needs; not part of the API.
+#[doc(hidden)]
+pub mod __private {
+    pub use crate::registry::TypeEntry;
+    pub use inventory;
+}

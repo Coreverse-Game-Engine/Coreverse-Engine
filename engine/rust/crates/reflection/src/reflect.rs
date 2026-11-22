@@ -5,6 +5,7 @@ use std::fmt;
 
 use crate::error::ReflectError;
 use crate::info::{TypeInfo, VariantKind};
+use crate::registry::TypeRegistration;
 
 /// A boxed iterator over borrowed reflected items; what the container traits return from `iter`.
 pub type ReflectIter<'a, I> = Box<dyn Iterator<Item = I> + 'a>;
@@ -142,6 +143,11 @@ pub trait Typed: Reflect + Sized {
     /// Implementations keep it in a [`TypeInfoCell`](crate::TypeInfoCell) (non-generic types) or a
     /// [`GenericTypeInfoCell`](crate::GenericTypeInfoCell) (generic types).
     fn static_type_info() -> &'static TypeInfo;
+
+    /// Adds the type data of this type (`ReflectDefault`, `ReflectClone`, ...) to its registration. The
+    /// default adds none. The derive writes it from `#[reflect(Default, Clone, ...)]`; the standard types
+    /// override it.
+    fn register_type_data(_registration: &mut TypeRegistration) {}
 }
 
 /// Writes the methods of a [`Reflect`] implementation that are the same for every type: `type_info`,

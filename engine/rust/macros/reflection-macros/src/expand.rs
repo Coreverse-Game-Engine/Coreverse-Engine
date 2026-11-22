@@ -6,7 +6,7 @@ use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
 use syn::{
     Data, DataEnum, DataStruct, DeriveInput, Error, Fields, GenericParam, Generics, Index, LitStr,
-    Result, Type, parse_quote,
+    Path, Result, Type, parse_quote,
 };
 
 use crate::attrs::{self, ContainerAttrs};
@@ -20,6 +20,12 @@ pub(crate) fn derive(input: &DeriveInput) -> Result<TokenStream> {
         return Err(Error::new_spanned(
             alias,
             "`alias` is not supported on generic types",
+        ));
+    }
+    if let Some(path) = container.data.first().filter(|_| generic) {
+        return Err(Error::new_spanned(
+            path,
+            "type data attributes are not supported on generic types; register the data with `TypeRegistry::add_type_data`",
         ));
     }
     let key = key_expr(&input.ident, &container, &input.generics);
@@ -231,13 +237,30 @@ fn match_or_none(scrutinee: &TokenStream, arms: &[TokenStream]) -> TokenStream {
     }
 }
 
-/// The three implementations around the kind-specific parts.
+/// The type of the type data an attribute names: the standard ones by their short names, anything else as
+/// written.
+fn data_type(path: &Path) -> TokenStream {
+    if let Some(ident) = path.get_ident() {
+        match ident.to_string().as_str() {
+            "Default" => return quote!(::reflection::ReflectDefault),
+            "Clone" => return quote!(::reflection::ReflectClone),
+            "PartialEq" => return quote!(::reflection::ReflectPartialEq),
+            "Debug" => return quote!(::reflection::ReflectDebug),
+            "Hash" => return quote!(::reflection::ReflectHash),
+            _ => {}
+        }
+    }
+    quote!(#path)
+}
+
+/// The three implementations around the kind-specific parts, and the `inventory` entry of a non-generic type.
 fn assemble(
     input: &DeriveInput,
     info: &TokenStream,
     reflect_kind: &Ident,
     kind_trait: &TokenStream,
     kind_body: &TokenStream,
+    container: &ContainerAttrs,
 ) -> TokenStream {
     let ident = &input.ident;
     let generics = bounded(&input.generics);
@@ -254,12 +277,39 @@ fn assemble(
             CELL.get_or_insert::<Self>(|| #info)
         }
     };
+    let data: Vec<TokenStream> = container.data.iter().map(data_type).collect();
+    let register_hook = if data.is_empty() {
+        quote!()
+    } else {
+        quote! {
+            fn register_type_data(registration: &mut ::reflection::TypeRegistration) {
+                #(
+                    registration.insert_data(
+                        <#data as ::reflection::FromType<Self>>::from_type(),
+                    );
+                )*
+            }
+        }
+    };
+    let submit = if input.generics.params.is_empty() {
+        quote! {
+            ::reflection::__private::inventory::submit! {
+                ::reflection::__private::TypeEntry::new(
+                    ::reflection::TypeRegistration::of::<#ident>
+                )
+            }
+        }
+    } else {
+        quote!()
+    };
     quote! {
         #[automatically_derived]
         impl #impl_generics ::reflection::Typed for #ident #ty_generics #where_clause {
             fn static_type_info() -> &'static ::reflection::TypeInfo {
                 #cell
             }
+
+            #register_hook
         }
 
         #[automatically_derived]
@@ -279,6 +329,8 @@ fn assemble(
         impl #impl_generics #kind_trait for #ident #ty_generics #where_clause {
             #kind_body
         }
+
+        #submit
     }
 }
 
@@ -356,6 +408,7 @@ fn expand_struct(
             &kind,
             &quote!(::reflection::TupleStruct),
             &body,
+            container,
         ));
     }
 
@@ -451,6 +504,7 @@ fn expand_struct(
         &kind,
         &quote!(::reflection::Struct),
         &body,
+        container,
     ))
 }
 
@@ -814,6 +868,7 @@ fn expand_enum(
         &kind,
         &quote!(::reflection::Enum),
         &body,
+        container,
     ))
 }
 
@@ -837,28 +892,59 @@ mod tests {
     }
 
     #[test]
-    fn struct_expands_to_three_impls() {
+    fn struct_expands_to_three_impls_and_an_inventory_entry() {
         let (items, text) = expand_source("struct Player { name: String, health: u32 }").unwrap();
-        assert_eq!(items, 3);
+        assert_eq!(items, 4);
+        assert!(text.contains("submit"));
+        assert!(text.contains("TypeEntry"));
         assert!(text.contains("StructInfo"));
         assert!(text.contains("\"health\""));
     }
 
     #[test]
     fn tuple_unit_and_enum_expand() {
-        assert_eq!(expand_source("struct Meters(f32);").unwrap().0, 3);
+        assert_eq!(expand_source("struct Meters(f32);").unwrap().0, 4);
         assert!(
             expand_source("struct Meters(f32);")
                 .unwrap()
                 .1
                 .contains("TupleStructInfo")
         );
-        assert_eq!(expand_source("struct Marker;").unwrap().0, 3);
+        assert_eq!(expand_source("struct Marker;").unwrap().0, 4);
         let (items, text) =
             expand_source("enum Shape { Empty, Circle(f32), Rect { w: f32, h: f32 } }").unwrap();
-        assert_eq!(items, 3);
+        assert_eq!(items, 4);
         assert!(text.contains("EnumInfo"));
         assert!(text.contains("with_named_fields"));
+    }
+
+    #[test]
+    fn generic_types_get_no_inventory_entry() {
+        let (items, text) = expand_source("struct Pair<A, B> { a: A, b: B }").unwrap();
+        assert_eq!(items, 3);
+        assert!(!text.contains("submit"));
+    }
+
+    #[test]
+    fn type_data_attributes_write_the_hook() {
+        let (_, text) =
+            expand_source("#[reflect(Default, Clone, PartialEq, Debug, Hash)] struct S { a: u8 }")
+                .unwrap();
+        assert!(text.contains("register_type_data"));
+        for name in [
+            "ReflectDefault",
+            "ReflectClone",
+            "ReflectPartialEq",
+            "ReflectDebug",
+            "ReflectHash",
+        ] {
+            assert!(text.contains(name), "{name} is missing");
+        }
+        let (_, text) = expand_source("#[reflect(my::ReflectThing)] struct S;").unwrap();
+        assert!(text.contains("ReflectThing"));
+        assert!(text.contains("FromType"));
+        let (_, text) = expand_source("struct S { a: u8 }").unwrap();
+        assert!(!text.contains("register_type_data"));
     }
 
     #[test]
@@ -905,6 +991,8 @@ mod tests {
         assert!(error_of("struct S { #[reflect(frobnicate)] a: u8 }").contains("unsupported"));
         assert!(error_of("enum E { #[reflect(skip)] A }").contains("unsupported"));
         assert!(error_of("#[reflect(alias = \"x\")] struct S<T> { a: T }").contains("generic"));
+        assert!(error_of("#[reflect(Default)] struct S<T> { a: T }").contains("generic"));
+        assert!(error_of("#[reflect(Default = 1)] struct S { a: u8 }").contains("expected"));
         assert!(error_of("struct S(#[reflect(rename = \"x\")] u8);").contains("name"));
         assert!(error_of("#[reflect(name = \"\")] struct S { a: u8 }").contains("empty"));
     }

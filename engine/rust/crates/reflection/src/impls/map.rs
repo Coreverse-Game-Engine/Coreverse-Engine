@@ -8,6 +8,8 @@ use crate::error::ReflectError;
 use crate::info::{MapInfo, TypeInfo, TypeRef};
 use crate::key::TypeKey;
 use crate::reflect::{Map, Reflect, ReflectIter, ReflectMut, ReflectRef, Typed};
+use crate::registry::TypeRegistration;
+use crate::type_data::{FromType, ReflectDefault};
 
 impl<K: Typed + Hash + Eq, V: Typed> Typed for HashMap<K, V> {
     fn static_type_info() -> &'static TypeInfo {
@@ -24,6 +26,10 @@ impl<K: Typed + Hash + Eq, V: Typed> Typed for HashMap<K, V> {
                 TypeRef::of::<V>(),
             ))
         })
+    }
+
+    fn register_type_data(registration: &mut TypeRegistration) {
+        registration.insert_data(<ReflectDefault as FromType<Self>>::from_type());
     }
 }
 
@@ -95,6 +101,10 @@ impl<K: Typed + Ord, V: Typed> Typed for BTreeMap<K, V> {
                 TypeRef::of::<V>(),
             ))
         })
+    }
+
+    fn register_type_data(registration: &mut TypeRegistration) {
+        registration.insert_data(<ReflectDefault as FromType<Self>>::from_type());
     }
 }
 

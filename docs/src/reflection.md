@@ -2,11 +2,12 @@
 
 `engine/rust/crates/reflection` is the engine's runtime type information: what a type is, what it is made of, and
 a way to read and change values without knowing their type at compile time. It is being built in milestones; this
-page describes what exists (R1, the core model, and R2, `#[derive(Reflect)]`) and what is planned. The crate uses `std`, `utilities` (the name
+page describes what exists (R1, the core model, R2, `#[derive(Reflect)]`, and R3, the type registry and type data)
+and what is planned. The crate uses `std`, `utilities` (the name
 hash and poison-tolerant locks) and `ccore` (`ReflectError` converts into `CoreError`), and contains no `unsafe`
 code.
 
-> **Verification status.** R1 and R2 were written in a sandbox without a Rust toolchain. They have not been
+> **Verification status.** R1, R2 and R3 were written in a sandbox without a Rust toolchain. They have not been
 > compiled, linted or tested yet. Run `cargo fmt --all`, `cargo clippy -p reflection -p reflection-macros
 > --all-targets`, `cargo test -p reflection -p reflection-macros` and `cargo doc -p reflection --no-deps` before
 > merging.
@@ -53,8 +54,8 @@ fields; `[T; N]`; `Vec<T>`; `Option<T>` (an enum with the variants `None` and `S
 * **`Option<T>` is an enum.** How it is written (`null`, a tagged union, ...) is up to the serializer.
 * **Reflection does not serialize.** It only describes and gives access; formats belong to the `serialization`
   crate, which will walk values through the visitor of R5.
-* **No `Debug` of reflected values yet.** `ReflectDebug`, `ReflectClone`, `ReflectPartialEq` and `ReflectDefault`
-  arrive with the type data of R3.
+* **`Debug`, `Clone`, `PartialEq`, `Default` and `Hash` of reflected values** go through the type data of R3, not
+  through the `Reflect` trait; structural versions (`reflect_eq`, `clone_value`) come with R4.
 
 ## Deriving (R2)
 
@@ -101,6 +102,48 @@ Derive-specific decisions:
 * Changing the variant of an enum in place is still not possible; `set` replaces the whole value (R4 adds dynamic
   values).
 
+## The registry and type data (R3)
+
+| Item | Purpose |
+|:-----|:--------|
+| `TypeRegistry` | The types a program knows how to reflect. `register::<T>()` registers `T` and everything it is made of (field types, variant fields, item, key and value types) with the type data each asks for; registering a type that is there is a no-op; a failure registers nothing. `from_inventory()` registers every derived non-generic type. Lookups: `get(TypeId)`, `get_by_type::<T>()`, `contains::<T>()`, `get_by_path(&str)` (path **or alias**), `get_by_id(u64)`, `get_by_key(&TypeKey)`, `data::<T, D>()`, `iter()`, `len()`. Helpers: `create_default(name)` and `clone_value(&dyn Reflect)`. `add_type_data::<T, D>(data)` registers `T` if needed and adds or replaces its data. There is no global registry. |
+| `TypeRegistration` | One registered type: its `TypeInfo` and a bag of type data keyed by the type data's `TypeId`: `info()`, `key()`, `path()`, `insert_data`, `data::<D>()`, `data_mut`, `has_data`, `remove_data`, `data_len`. `TypeRegistration::of::<T>()` is `T`'s description plus `T::register_type_data`. |
+| `TypeData`, `FromType<T>` | Type data is any `Any + Send + Sync` value. `FromType<T>` builds the type data `Self` for `T`; it is what `#[reflect(Name)]` calls. |
+| `ReflectDefault` | `create() -> Box<dyn Reflect>` for a `Default` type. |
+| `ReflectClone` | `clone_value(&dyn Reflect) -> Result<Box<dyn Reflect>, ReflectError>` for a `Clone` type. |
+| `ReflectPartialEq` | `eq(&dyn Reflect, &dyn Reflect) -> Result<bool, ReflectError>`. |
+| `ReflectDebug` | `debug(&dyn Reflect)` returns a value that prints with the type's `Debug` (a value of another type prints `<type mismatch>`). |
+| `ReflectHash` | `hash_value(&dyn Reflect, &mut dyn Hasher) -> Result<(), ReflectError>`. |
+| `Typed::register_type_data` | A default method that does nothing; the derive and the standard types override it. |
+| `ReflectError` | New variants `NameConflict { name, existing, new }`, `HashCollision { id, existing, new }`, `UnknownType { name }`, `MissingTypeData { path, data }`. |
+
+The standard types register the data of the traits they implement: all the opaque types get `ReflectDefault`,
+`ReflectClone`, `ReflectPartialEq` and `ReflectDebug`, and all but `f32`/`f64` get `ReflectHash`; `Vec`, `Option`,
+the maps and the sets get `ReflectDefault` only (their other traits depend on the item types, which the `Typed`
+bounds do not know about). Arrays, tuples and `Box` get none. Use `add_type_data` for anything else.
+
+On the derive: `#[reflect(Default, Clone, PartialEq, Debug, Hash)]` stores the matching data (the type has to
+implement the traits); any other name that starts with an uppercase letter (`#[reflect(ReflectComponent)]`,
+`#[reflect(my::ReflectThing)]`) is a type data of your own and gets `<Name as FromType<Type>>::from_type()`. Type
+data attributes are rejected on generic types (the hook would need `T: Default` and the like); use
+`TypeRegistry::add_type_data` for a generic instantiation. Every non-generic derived type also submits a
+`TypeEntry` to `inventory` (re-exported as `reflection::__private`, not part of the API).
+
+Registry-specific decisions:
+
+* **Names.** The path and every alias of a type go into one name table; a second *different* type that wants a
+  name already in the table is a `NameConflict` (`existing` and `new` are the paths of the two types, so two types
+  with the same path show the same text twice). Two paths with the same 64-bit hash are a `HashCollision`; it is
+  checked but cannot be produced by a test with realistic names.
+* **All or nothing.** `register` first collects the type and everything it contains that is not registered yet,
+  checks all of them against the registry and against each other, and only then inserts them.
+* **Deterministic inventory.** `from_inventory` sorts the submitted types by path before registering them, so the
+  same program reports the same conflict every time (the linker's order is not stable).
+* **Aliases resolve in `get_by_path` and `create_default`**, nowhere else yet (paths and `apply` come in R4).
+* **Type data is registered, not discovered.** A type is only as capable as its registration says; nothing
+  checks that `#[reflect(Clone)]` was written for a type that is `Clone` except the compiler (it would not
+  compile otherwise).
+
 ## Example
 
 ```rust
@@ -120,7 +163,9 @@ assert_eq!(numbers, [1, 2, 3]);
 `crates/reflection/tests/hand_written.rs` shows what a hand-written implementation looks like (a `Typed` impl with a
 `TypeInfoCell`, a `Reflect` impl that starts with `impl_reflect_boilerplate!()`, and a `Struct` impl) for a struct
 with five fields and a recursive `Node`; `tests/derive.rs` covers the derive: structs, tuple and unit structs, enums,
-generics, paths, aliases and skipped fields, recursive types, containers of derived types.
+generics, paths, aliases and skipped fields, recursive types, containers of derived types; `tests/registry.rs` and
+`tests/registry_conflicts.rs` cover the registry, type data and name conflicts (every integration test file is its own
+program, so each has its own `inventory`).
 
 ## Planned
 
@@ -128,7 +173,7 @@ generics, paths, aliases and skipped fields, recursive types, containers of deri
 |:----------|:---------|
 | R1 | The core model. Implemented. |
 | R2 | `reflection-macros` (`engine/rust/macros`): `#[derive(Reflect)]` for structs, tuple structs, unit structs, enums and generics; `skip`, `name`, `alias`, `rename`. Implemented. |
-| R3 | `TypeRegistry` (lookup by key, name and alias; collision errors), automatic collection with `inventory`, `TypeData` (`ReflectDefault`, `ReflectClone`, `ReflectPartialEq`, `ReflectDebug`, `ReflectHash`). |
+| R3 | `TypeRegistry` (lookup by key, name and alias; collision errors), automatic collection with `inventory`, `TypeData` (`ReflectDefault`, `ReflectClone`, `ReflectPartialEq`, `ReflectDebug`, `ReflectHash`). Implemented. |
 | R4 | Paths (`a.b[2].c`), `apply`, `clone_value`, `reflect_eq`, dynamic values and `FromReflect`. |
 | R5 | Field and type metadata (range, tooltip, category, readonly, hidden, transient, custom attributes) and a visitor. |
 | R6 | Engine types behind features (`math`, `ccore` ids, `Version`, `Handle`), `Arc` and `Cow`, edge cases. |

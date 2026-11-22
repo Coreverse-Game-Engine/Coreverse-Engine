@@ -8,6 +8,8 @@ use crate::error::ReflectError;
 use crate::info::{SetInfo, TypeInfo, TypeRef};
 use crate::key::TypeKey;
 use crate::reflect::{Reflect, ReflectIter, ReflectMut, ReflectRef, Set, Typed};
+use crate::registry::TypeRegistration;
+use crate::type_data::{FromType, ReflectDefault};
 
 impl<T: Typed + Hash + Eq> Typed for HashSet<T> {
     fn static_type_info() -> &'static TypeInfo {
@@ -16,6 +18,10 @@ impl<T: Typed + Hash + Eq> Typed for HashSet<T> {
             let key = TypeKey::from_owned(&format!("HashSet<{}>", T::static_type_info().path()));
             TypeInfo::Set(SetInfo::new::<Self>(key, TypeRef::of::<T>()))
         })
+    }
+
+    fn register_type_data(registration: &mut TypeRegistration) {
+        registration.insert_data(<ReflectDefault as FromType<Self>>::from_type());
     }
 }
 
@@ -71,6 +77,10 @@ impl<T: Typed + Ord> Typed for BTreeSet<T> {
             let key = TypeKey::from_owned(&format!("BTreeSet<{}>", T::static_type_info().path()));
             TypeInfo::Set(SetInfo::new::<Self>(key, TypeRef::of::<T>()))
         })
+    }
+
+    fn register_type_data(registration: &mut TypeRegistration) {
+        registration.insert_data(<ReflectDefault as FromType<Self>>::from_type());
     }
 }
 
