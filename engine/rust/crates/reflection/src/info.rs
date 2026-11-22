@@ -62,6 +62,7 @@ impl fmt::Debug for TypeRef {
 struct Header {
     key: TypeKey,
     std_id: TypeId,
+    aliases: &'static [&'static str],
 }
 
 impl Header {
@@ -69,6 +70,7 @@ impl Header {
         Self {
             key,
             std_id: TypeId::of::<T>(),
+            aliases: &[],
         }
     }
 }
@@ -94,6 +96,19 @@ macro_rules! header_methods {
         pub fn is<T: Any>(&self) -> bool {
             self.header.std_id == TypeId::of::<T>()
         }
+
+        /// The other paths the type was known by (old names, kept so that old data can still be read);
+        /// empty for most types.
+        pub fn aliases(&self) -> &'static [&'static str] {
+            self.header.aliases
+        }
+
+        /// The description with the given aliases.
+        #[must_use]
+        pub fn with_aliases(mut self, aliases: &'static [&'static str]) -> Self {
+            self.header.aliases = aliases;
+            self
+        }
     };
 }
 
@@ -103,6 +118,7 @@ pub struct FieldInfo {
     name: Option<&'static str>,
     index: usize,
     ty: TypeRef,
+    aliases: &'static [&'static str],
 }
 
 impl FieldInfo {
@@ -112,6 +128,7 @@ impl FieldInfo {
             name: Some(name),
             index,
             ty,
+            aliases: &[],
         }
     }
 
@@ -121,7 +138,16 @@ impl FieldInfo {
             name: None,
             index,
             ty,
+            aliases: &[],
         }
+    }
+
+    /// The field with the given aliases: other names it was known by (old names, kept so that old data can
+    /// still be read).
+    #[must_use]
+    pub fn with_aliases(mut self, aliases: &'static [&'static str]) -> Self {
+        self.aliases = aliases;
+        self
     }
 
     /// The name of the field; `None` for the fields of tuples and tuple structs.
@@ -137,6 +163,11 @@ impl FieldInfo {
     /// The type of the field.
     pub const fn ty(&self) -> TypeRef {
         self.ty
+    }
+
+    /// The other names the field was known by; empty for most fields.
+    pub const fn aliases(&self) -> &'static [&'static str] {
+        self.aliases
     }
 }
 
@@ -272,6 +303,7 @@ pub struct VariantInfo {
     index: usize,
     kind: VariantKind,
     fields: Vec<FieldInfo>,
+    aliases: &'static [&'static str],
 }
 
 impl VariantInfo {
@@ -282,6 +314,7 @@ impl VariantInfo {
             index,
             kind: VariantKind::Unit,
             fields: Vec::new(),
+            aliases: &[],
         }
     }
 
@@ -292,6 +325,7 @@ impl VariantInfo {
             index,
             kind: VariantKind::Tuple,
             fields,
+            aliases: &[],
         }
     }
 
@@ -306,7 +340,15 @@ impl VariantInfo {
             index,
             kind: VariantKind::Struct,
             fields,
+            aliases: &[],
         }
+    }
+
+    /// The variant with the given aliases: other names it was known by.
+    #[must_use]
+    pub fn with_aliases(mut self, aliases: &'static [&'static str]) -> Self {
+        self.aliases = aliases;
+        self
     }
 
     /// The name of the variant.
@@ -322,6 +364,11 @@ impl VariantInfo {
     /// The kind of fields the variant has.
     pub const fn kind(&self) -> VariantKind {
         self.kind
+    }
+
+    /// The other names the variant was known by; empty for most variants.
+    pub const fn aliases(&self) -> &'static [&'static str] {
+        self.aliases
     }
 
     /// The fields of the variant, in declaration order.
@@ -564,6 +611,21 @@ impl TypeInfo {
     /// The 64-bit hash of the path.
     pub fn id(&self) -> u64 {
         self.key().id()
+    }
+
+    /// The other paths the type was known by; empty for most types.
+    pub fn aliases(&self) -> &'static [&'static str] {
+        match self {
+            Self::Struct(info) => info.aliases(),
+            Self::TupleStruct(info) => info.aliases(),
+            Self::Tuple(info) => info.aliases(),
+            Self::Enum(info) => info.aliases(),
+            Self::List(info) => info.aliases(),
+            Self::Array(info) => info.aliases(),
+            Self::Map(info) => info.aliases(),
+            Self::Set(info) => info.aliases(),
+            Self::Opaque(info) => info.aliases(),
+        }
     }
 
     /// The standard `TypeId` of the type.

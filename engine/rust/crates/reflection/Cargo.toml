@@ -1,6 +1,6 @@
 [package]
 name = "reflection"
-description = "Coreverse's runtime type information (milestone R1): stable type keys, static type descriptions, the Reflect traits and reflection of the standard types; no unsafe code"
+description = "Coreverse's runtime type information (milestones R1-R2): stable type keys, static type descriptions, the Reflect traits, reflection of the standard types and #[derive(Reflect)]; no unsafe code"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 ccore = { path = "../ccore" }
+reflection-macros = { path = "../../macros/reflection-macros" }
 utilities = { path = "../utilities" }
 
 [lints]
