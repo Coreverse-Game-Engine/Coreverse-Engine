@@ -28,8 +28,9 @@ enum class CullMode {
 };
 
 /// Everything needed to build a graphics pipeline for the swapchain it is created against.
-/// The shaders are SPIR-V (GLSL compiled with glslangValidator/glslc; see
-/// BuiltinShaders.hpp for the engine's own). Entry point is `main` for both.
+/// The shaders are SPIR-V (from Slang, GLSL or HLSL; see BuiltinShaders.hpp for the engine's own,
+/// compiled with Slang). Entry point is `main` for both (slangc names SPIR-V entry points `main`
+/// unless told otherwise).
 struct GraphicsPipelineDesc {
     std::span<const std::uint32_t> vertexShader;   ///< SPIR-V words.
     std::span<const std::uint32_t> fragmentShader; ///< SPIR-V words.

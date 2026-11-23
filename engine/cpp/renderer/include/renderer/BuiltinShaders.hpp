@@ -7,8 +7,8 @@
 
 namespace renderer {
 
-/// The engine's built-in "colored mesh" shader pair (SPIR-V; GLSL sources and the generator
-/// script are in engine/cpp/renderer/shaders/). Vertex layout is ColoredVertex, the push
+/// The engine's built-in "colored mesh" shader pair (SPIR-V compiled from colored_mesh.slang; the
+/// Slang source and the generator script are in engine/cpp/renderer/shaders/). Vertex layout is ColoredVertex, the push
 /// constant block is one 4x4 matrix (the MVP, 64 bytes, column-major like cv_math::Mat4).
 [[nodiscard]] std::span<const std::uint32_t> ColoredMeshVertexShader() noexcept;
 [[nodiscard]] std::span<const std::uint32_t> ColoredMeshFragmentShader() noexcept;

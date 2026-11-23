@@ -23,6 +23,9 @@ install_manifest.txt
 Makefile
 *.cmake.user
 
+# Project-local tools downloaded by devkit/scripts/get_slangc.py (Slang compiler)
+/.tools/
+
 # vcpkg
 /vcpkg/installed/
 /vcpkg_installed/

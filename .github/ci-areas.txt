@@ -101,6 +101,7 @@ format rustfmt.toml
 format .rustfmt.toml
 format Cargo.toml
 format devkit/scripts/setup/config/tool-versions.json
+format devkit/scripts/get_slangc.py
 
 # ---- mobile / window-system jobs ------------------------------------------------
 ffi Cargo.toml

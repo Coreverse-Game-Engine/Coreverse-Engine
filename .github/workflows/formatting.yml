@@ -42,6 +42,16 @@ jobs:
                   echo "$venv/bin" >> "$GITHUB_PATH"
                   "$venv/bin/clang-format" --version
 
+            # src/BuiltinShaders.cpp is generated from the Slang sources in
+            # engine/cpp/renderer/shaders/ and committed, so building never needs
+            # a shader compiler. This regenerates it with the pinned slangc
+            # (shaders/slang-version.json, SHA-256 checked) and fails when the
+            # committed file differs. It runs after the clang-format install on
+            # purpose: the generated file is formatted with the same version.
+            - name: Built-in shaders are up to date (Slang)
+              shell: bash
+              run: python3 engine/cpp/renderer/shaders/generate_builtin_shaders.py --download --check
+
             - name: Rustfmt
               run: cargo fmt --all -- --check
 

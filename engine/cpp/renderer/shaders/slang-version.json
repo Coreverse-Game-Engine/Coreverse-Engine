@@ -1,0 +1,13 @@
+{
+    "_comment": "Pinned Slang compiler for shaders/generate_builtin_shaders.py (devkit/scripts/get_slangc.py downloads exactly this build and checks the SHA-256). Bump version + every sha256 together, then regenerate src/BuiltinShaders.cpp.",
+    "version": "2026.22.1",
+    "url": "https://github.com/shader-slang/slang/releases/download/v{version}/slang-{version}-{platform}.{ext}",
+    "platforms": {
+        "windows-x86_64": { "ext": "zip", "sha256": "e72344f7b0323cec8b039c534caaf4680e7ba629489fc796ea4c7f7adb7deb68" },
+        "windows-aarch64": { "ext": "zip", "sha256": "7c50b36af8428533f524604d10cf84936dbd94d8536940d0611cb754ad4bea7c" },
+        "linux-x86_64": { "ext": "tar.gz", "sha256": "37156099ebaabf62cd92522eba55eb93b8663e65ea3be618ce015d9a8edda6bc" },
+        "linux-aarch64": { "ext": "tar.gz", "sha256": "24b98d0bed7a4d9946dc78f5f0b19c2baaf013d3d2c05115894f161dab124266" },
+        "macos-x86_64": { "ext": "zip", "sha256": "8aed14d3feb644fe12cab00f85a00cf31477199d585a23c20f5f1e2efee43d66" },
+        "macos-aarch64": { "ext": "zip", "sha256": "ca329cb05ff47c0216c5208481d3488c67f998c9b8d8b7780f6a15d82a0a356b" }
+    }
+}
