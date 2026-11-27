@@ -4,6 +4,8 @@ use std::fmt;
 
 use ccore::CoreError;
 
+use crate::reflect::ReflectKind;
+
 /// Why a reflective operation failed.
 ///
 /// The enum is `#[non_exhaustive]`: later milestones add variants (paths, dynamic values).
@@ -55,12 +57,57 @@ pub enum ReflectError {
         /// The name of the type data (`ReflectDefault`, ...).
         data: &'static str,
     },
+    /// The text of a path could not be parsed.
+    InvalidPath {
+        /// The text that was given.
+        path: String,
+        /// The byte position of the problem in the text.
+        position: usize,
+        /// What is wrong.
+        reason: &'static str,
+    },
+    /// A path does not fit the value it was applied to.
+    PathMismatch {
+        /// The text of the path.
+        path: String,
+        /// The position of the failing segment (0 is the first).
+        segment: usize,
+        /// What is wrong.
+        reason: &'static str,
+    },
+    /// A value of another kind than the operation needs.
+    KindMismatch {
+        /// The kind the operation needs.
+        expected: ReflectKind,
+        /// The kind of the value that was given.
+        actual: ReflectKind,
+    },
+    /// An array (or other fixed-size value) of another length.
+    LengthMismatch {
+        /// The length the operation needs.
+        expected: usize,
+        /// The length of the value that was given.
+        actual: usize,
+    },
+    /// The operation is not possible for this type: an opaque value that cannot be cloned, a value that cannot
+    /// be built from a reflected one, ...
+    Unsupported {
+        /// What was attempted.
+        operation: &'static str,
+        /// The path of the type.
+        path: &'static str,
+    },
 }
 
 impl ReflectError {
     /// A [`ReflectError::TypeMismatch`] for the given type paths.
     pub const fn type_mismatch(expected: &'static str, actual: &'static str) -> Self {
         Self::TypeMismatch { expected, actual }
+    }
+
+    /// A [`ReflectError::Unsupported`] for the given operation and type path.
+    pub const fn unsupported(operation: &'static str, path: &'static str) -> Self {
+        Self::Unsupported { operation, path }
     }
 
     /// A [`ReflectError::IndexOutOfBounds`] for the given index and length.
@@ -93,6 +140,28 @@ impl fmt::Display for ReflectError {
             Self::UnknownType { name } => write!(f, "no type is registered under `{name}`"),
             Self::MissingTypeData { path, data } => {
                 write!(f, "`{path}` has no `{data}` registered")
+            }
+            Self::InvalidPath {
+                path,
+                position,
+                reason,
+            } => write!(f, "invalid path `{path}` at byte {position}: {reason}"),
+            Self::PathMismatch {
+                path,
+                segment,
+                reason,
+            } => write!(
+                f,
+                "path `{path}` does not fit at segment {segment}: {reason}"
+            ),
+            Self::KindMismatch { expected, actual } => {
+                write!(f, "kind mismatch: expected a {expected}, got a {actual}")
+            }
+            Self::LengthMismatch { expected, actual } => {
+                write!(f, "length mismatch: expected {expected}, got {actual}")
+            }
+            Self::Unsupported { operation, path } => {
+                write!(f, "cannot {operation} a value of type `{path}`")
             }
         }
     }
@@ -139,6 +208,28 @@ mod tests {
         assert_eq!(
             missing.to_string(),
             "`x::Y` has no `ReflectDefault` registered"
+        );
+        let invalid = ReflectError::InvalidPath {
+            path: "a[".to_string(),
+            position: 1,
+            reason: "missing `]`",
+        };
+        assert_eq!(
+            invalid.to_string(),
+            "invalid path `a[` at byte 1: missing `]`"
+        );
+        let kinds = ReflectError::KindMismatch {
+            expected: ReflectKind::Struct,
+            actual: ReflectKind::List,
+        };
+        assert_eq!(
+            kinds.to_string(),
+            "kind mismatch: expected a struct, got a list"
+        );
+        let unsupported = ReflectError::unsupported("clone", "x::Y");
+        assert_eq!(
+            unsupported.to_string(),
+            "cannot clone a value of type `x::Y`"
         );
     }
 

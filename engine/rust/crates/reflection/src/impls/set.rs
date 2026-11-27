@@ -23,6 +23,17 @@ impl<T: Typed + Hash + Eq> Typed for HashSet<T> {
     fn register_type_data(registration: &mut TypeRegistration) {
         registration.insert_data(<ReflectDefault as FromType<Self>>::from_type());
     }
+
+    fn from_reflect(value: &dyn Reflect) -> Option<Self> {
+        let ReflectRef::Set(view) = value.reflect_ref() else {
+            return None;
+        };
+        let mut set: HashSet<T> = HashSet::new();
+        for item in view.iter() {
+            HashSet::insert(&mut set, T::from_reflect(item)?);
+        }
+        Some(set)
+    }
 }
 
 impl<T: Typed + Hash + Eq> Reflect for HashSet<T> {
@@ -50,7 +61,7 @@ impl<T: Typed + Hash + Eq> Set for HashSet<T> {
     }
 
     fn insert(&mut self, value: Box<dyn Reflect>) -> Result<bool, ReflectError> {
-        let value = value.take::<T>()?;
+        let value = value.take_or_convert::<T>()?;
         Ok(HashSet::insert(self, value))
     }
 
@@ -82,6 +93,17 @@ impl<T: Typed + Ord> Typed for BTreeSet<T> {
     fn register_type_data(registration: &mut TypeRegistration) {
         registration.insert_data(<ReflectDefault as FromType<Self>>::from_type());
     }
+
+    fn from_reflect(value: &dyn Reflect) -> Option<Self> {
+        let ReflectRef::Set(view) = value.reflect_ref() else {
+            return None;
+        };
+        let mut set: BTreeSet<T> = BTreeSet::new();
+        for item in view.iter() {
+            BTreeSet::insert(&mut set, T::from_reflect(item)?);
+        }
+        Some(set)
+    }
 }
 
 impl<T: Typed + Ord> Reflect for BTreeSet<T> {
@@ -109,7 +131,7 @@ impl<T: Typed + Ord> Set for BTreeSet<T> {
     }
 
     fn insert(&mut self, value: Box<dyn Reflect>) -> Result<bool, ReflectError> {
-        let value = value.take::<T>()?;
+        let value = value.take_or_convert::<T>()?;
         Ok(BTreeSet::insert(self, value))
     }
 

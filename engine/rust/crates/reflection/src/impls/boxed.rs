@@ -20,6 +20,13 @@ impl<T: Typed> Typed for Box<T> {
             ))
         })
     }
+
+    fn from_reflect(value: &dyn Reflect) -> Option<Self> {
+        let ReflectRef::TupleStruct(view) = value.reflect_ref() else {
+            return None;
+        };
+        T::from_reflect(view.field(0)?).map(Box::new)
+    }
 }
 
 impl<T: Typed> Reflect for Box<T> {

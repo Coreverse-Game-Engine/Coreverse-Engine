@@ -29,10 +29,28 @@ macro_rules! impl_opaque {
                         registration.insert_data(<$data as FromType<$ty>>::from_type());
                     )*
                 }
+
+                fn from_reflect(value: &dyn Reflect) -> Option<Self> {
+                    value.downcast_ref::<$ty>().cloned()
+                }
             }
 
             impl Reflect for $ty {
                 crate::impl_reflect_boilerplate!();
+
+                #[allow(clippy::unit_arg)]
+                fn opaque_clone(&self) -> Option<Box<dyn Reflect>> {
+                    Some(Box::new(Clone::clone(self)))
+                }
+
+                #[allow(clippy::unit_cmp)]
+                fn opaque_eq(&self, other: &dyn Reflect) -> Option<bool> {
+                    Some(
+                        other
+                            .downcast_ref::<$ty>()
+                            .is_some_and(|other| self == other),
+                    )
+                }
 
                 fn reflect_ref(&self) -> ReflectRef<'_> {
                     ReflectRef::Opaque(self)

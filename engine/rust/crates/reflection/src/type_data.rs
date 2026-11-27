@@ -212,3 +212,37 @@ impl fmt::Debug for ReflectHash {
         f.debug_struct("ReflectHash").finish_non_exhaustive()
     }
 }
+
+/// The function a [`ReflectFromReflect`] calls.
+type FromReflectFn = fn(&dyn Reflect) -> Option<Box<dyn Reflect>>;
+
+/// Builds a value of a type from a reflected value of the same shape ([`Typed::from_reflect`]), for code that
+/// only knows the type by name. Every registration has one; for a type that cannot be built from a reflected
+/// value (the default of `Typed::from_reflect`) it always returns `None`.
+#[derive(Clone, Copy)]
+pub struct ReflectFromReflect {
+    from_reflect: FromReflectFn,
+}
+
+impl ReflectFromReflect {
+    /// A new value of the type built from `value`, or `None` if it cannot be built.
+    pub fn from_reflect(&self, value: &dyn Reflect) -> Option<Box<dyn Reflect>> {
+        (self.from_reflect)(value)
+    }
+}
+
+impl<T: Typed> FromType<T> for ReflectFromReflect {
+    fn from_type() -> Self {
+        Self {
+            from_reflect: |value: &dyn Reflect| {
+                T::from_reflect(value).map(|built| Box::new(built) as Box<dyn Reflect>)
+            },
+        }
+    }
+}
+
+impl fmt::Debug for ReflectFromReflect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReflectFromReflect").finish_non_exhaustive()
+    }
+}

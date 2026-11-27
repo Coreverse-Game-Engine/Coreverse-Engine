@@ -207,7 +207,8 @@ fn standard_types_come_with_type_data() {
     assert!(!float.has_data::<ReflectHash>());
     let integer = registry.get_by_type::<u32>().unwrap();
     assert!(integer.has_data::<ReflectHash>());
-    assert_eq!(integer.data_len(), 5);
+    // ReflectFromReflect plus the five standard traits.
+    assert_eq!(integer.data_len(), 6);
 }
 
 #[test]
@@ -244,7 +245,8 @@ fn type_data_can_be_added_by_hand() {
     assert!(registration.has_data::<ReflectDefault>());
     assert!(registration.remove_data::<ReflectDefault>());
     assert!(!registration.remove_data::<ReflectDefault>());
-    assert_eq!(registration.data_len(), 0);
+    // Only the ReflectFromReflect every registration has is left.
+    assert_eq!(registration.data_len(), 1);
 }
 
 #[test]

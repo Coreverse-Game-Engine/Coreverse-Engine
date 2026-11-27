@@ -25,6 +25,17 @@ impl<T: Typed> Typed for Option<T> {
     fn register_type_data(registration: &mut TypeRegistration) {
         registration.insert_data(<ReflectDefault as FromType<Self>>::from_type());
     }
+
+    fn from_reflect(value: &dyn Reflect) -> Option<Self> {
+        let ReflectRef::Enum(view) = value.reflect_ref() else {
+            return None;
+        };
+        match view.variant_name() {
+            "None" => Some(None),
+            "Some" => Some(Some(T::from_reflect(view.field_at(0)?)?)),
+            _ => None,
+        }
+    }
 }
 
 impl<T: Typed> Reflect for Option<T> {

@@ -1,9 +1,9 @@
 //! `reflection` — runtime type information for the Coreverse Engine: what a type is and what it is made
 //! of, and a way to read and change values without knowing their type at compile time.
 //!
-//! The crate is built in milestones (see `docs/src/reflection.md`). This is **R3**: the core model (R1),
-//! `#[derive(Reflect)]` (R2), the type registry and type data (R3). There are no paths or dynamic values yet
-//! (R4).
+//! The crate is built in milestones (see `docs/src/reflection.md`). This is **R4**: the core model (R1),
+//! `#[derive(Reflect)]` (R2), the type registry and type data (R3), paths, `apply`, structural clone and
+//! equality, dynamic values and `from_reflect` (R4).
 //!
 //! # What is here today
 //!
@@ -31,6 +31,10 @@
 //! * Type data ([`ReflectDefault`], [`ReflectClone`], [`ReflectPartialEq`], [`ReflectDebug`],
 //!   [`ReflectHash`], or your own through [`FromType`]): function tables that let code holding only a
 //!   `&dyn Reflect` or a type name use `Default`, `Clone`, `PartialEq`, `Debug` and `Hash`.
+//! * Paths ([`ReflectPath`], [`GetPath`]): `player.get_path::<u32>("stats.health")`, `items[2].0`.
+//! * [`Reflect::apply`], [`Reflect::clone_value`] and [`Reflect::reflect_eq`]: structural copy, snapshot and
+//!   comparison, built on dynamic values ([`DynamicStruct`], [`DynamicList`], ...), which can also be written
+//!   by hand as patches. [`Typed::from_reflect`] builds a concrete value back from a reflected one.
 //! * [`impl_reflect_boilerplate!`], [`TypeInfoCell`] and [`GenericTypeInfoCell`]: what an implementation
 //!   written by hand needs; the derive uses all three.
 //!
@@ -117,6 +121,53 @@
 //! alias ([`ReflectError::NameConflict`]). Every non-generic derived type also submits itself to
 //! `inventory`, so `TypeRegistry::from_inventory()` finds all of them without a list.
 //!
+//! # Paths, snapshots and patches
+//!
+//! ```
+//! use reflection::{DynamicStruct, GetPath, Reflect, Typed};
+//!
+//! #[derive(Reflect, Debug, PartialEq, Clone)]
+//! struct Stats {
+//!     health: u32,
+//!     mana: u32,
+//! }
+//!
+//! #[derive(Reflect, Debug, PartialEq, Clone)]
+//! struct Player {
+//!     name: String,
+//!     stats: Stats,
+//!     items: Vec<String>,
+//! }
+//!
+//! let mut player = Player {
+//!     name: "Ada".into(),
+//!     stats: Stats { health: 10, mana: 5 },
+//!     items: vec!["axe".into()],
+//! };
+//! assert_eq!(player.get_path::<String>("items[0]").unwrap(), "axe");
+//!
+//! // A snapshot made of dynamic values, applied back later (undo).
+//! let snapshot = player.clone_value().unwrap();
+//! *player.get_path_mut::<u32>("stats.health").unwrap() = 99;
+//! player.items.push("bow".into());
+//! assert_eq!(player.reflect_eq(&*snapshot), Some(false));
+//! player.apply(&*snapshot).unwrap();
+//! assert_eq!(player.stats.health, 10);
+//! assert_eq!(player.items.len(), 1);
+//!
+//! // A patch: only the fields it has are changed.
+//! let mut stats = DynamicStruct::new();
+//! stats.insert("mana", 7_u32);
+//! let mut patch = DynamicStruct::new();
+//! patch.insert("stats", stats);
+//! player.apply(&patch).unwrap();
+//! assert_eq!(player.stats, Stats { health: 10, mana: 7 });
+//!
+//! // And back to a concrete value.
+//! let copy = Player::from_reflect(&*player.clone_value().unwrap()).unwrap();
+//! assert_eq!(copy, player);
+//! ```
+//!
 //! Wrong uses fail to compile:
 //!
 //! ```compile_fail
@@ -159,21 +210,29 @@
 extern crate self as reflection;
 
 mod cell;
+mod dynamic;
 mod error;
 mod impls;
 mod info;
 mod key;
+mod ops;
+mod path;
 mod reflect;
 mod registry;
 mod type_data;
 
 pub use cell::{GenericTypeInfoCell, TypeInfoCell};
+pub use dynamic::{
+    DynamicArray, DynamicEnum, DynamicList, DynamicMap, DynamicSet, DynamicStruct, DynamicTuple,
+    DynamicTupleStruct, DynamicVariant,
+};
 pub use error::ReflectError;
 pub use info::{
     ArrayInfo, EnumInfo, FieldInfo, ListInfo, MapInfo, OpaqueInfo, SetInfo, StructInfo, TupleInfo,
     TupleStructInfo, TypeInfo, TypeRef, VariantInfo, VariantKind,
 };
 pub use key::TypeKey;
+pub use path::{GetPath, PathSegment, ReflectPath};
 pub use reflect::{
     Array, Enum, List, Map, Reflect, ReflectIter, ReflectKind, ReflectMut, ReflectRef, Set, Struct,
     Tuple, TupleStruct, Typed,
@@ -181,8 +240,8 @@ pub use reflect::{
 pub use reflection_macros::Reflect;
 pub use registry::{TypeRegistration, TypeRegistry};
 pub use type_data::{
-    DebugValue, FromType, ReflectClone, ReflectDebug, ReflectDefault, ReflectHash,
-    ReflectPartialEq, TypeData,
+    DebugValue, FromType, ReflectClone, ReflectDebug, ReflectDefault, ReflectFromReflect,
+    ReflectHash, ReflectPartialEq, TypeData,
 };
 
 /// What the code written by `#[derive(Reflect)]` needs; not part of the API.

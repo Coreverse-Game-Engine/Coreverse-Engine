@@ -28,10 +28,16 @@ mod expand;
 /// * `name = "game::Player"`: the path of the type (for a generic type, the part before the arguments).
 /// * `alias = "game::OldPlayer"`: another path the type was known by; repeat it for several. Not allowed on
 ///   generic types.
+/// * `no_from_reflect`: do not write `Typed::from_reflect` (see below).
 /// * `Default`, `Clone`, `PartialEq`, `Debug`, `Hash`: store `ReflectDefault`, `ReflectClone`,
 ///   `ReflectPartialEq`, `ReflectDebug` or `ReflectHash` in the type's registration (the type has to
 ///   implement the trait). Any other name that starts with an uppercase letter is a type data of your own: the
 ///   macro calls `<Name as FromType<Type>>::from_type()`. Not allowed on generic types.
+///
+/// The derive also writes `Typed::from_reflect`, which builds the type from a reflected value of the same
+/// shape: fields are built with `from_reflect` of their types, skipped fields with `Default::default()` (so a
+/// skipped field has to be `Default`, or the type has to opt out with `no_from_reflect`), `default` fields
+/// only when the source lacks them, and an enum picks its variant by name or alias.
 ///
 /// Every non-generic type also submits a `TypeEntry` to `inventory`, which `TypeRegistry::from_inventory`
 /// collects.
@@ -43,6 +49,7 @@ mod expand;
 /// * `rename = "hp"`: the reflected name of a named field.
 /// * `alias = "health"`: another name of a named field; repeat it for several. `field` and `field_mut` accept
 ///   aliases, `name_at` and the description give the name.
+/// * `default`: `from_reflect` uses `Default::default()` when the value it is given has no such field.
 ///
 /// On an enum variant:
 ///

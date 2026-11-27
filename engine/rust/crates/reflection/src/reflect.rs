@@ -101,6 +101,76 @@ pub trait Reflect: Any + Send + Sync {
     fn kind(&self) -> ReflectKind {
         self.type_info().kind()
     }
+
+    /// The type this value stands for: its own type for an ordinary value; for a dynamic value (see
+    /// `DynamicStruct` and the others) the type it was cloned from, or `None` if it stands for no type.
+    fn represented_type_info(&self) -> Option<&'static TypeInfo> {
+        Some(self.type_info())
+    }
+
+    /// A clone of an opaque value, as a boxed value of the same type. `None` for values that cannot be
+    /// cloned and for every kind but [`ReflectKind::Opaque`]. The standard opaque types override it; a
+    /// hand-written opaque type that is `Clone` should too, or [`Reflect::clone_value`] and
+    /// [`Reflect::apply`] fail on it.
+    fn opaque_clone(&self) -> Option<Box<dyn Reflect>> {
+        None
+    }
+
+    /// Whether an opaque value equals `other`: `Some(false)` if `other` is of another type, `None` if the type
+    /// cannot be compared. The standard opaque types override it.
+    fn opaque_eq(&self, _other: &dyn Reflect) -> Option<bool> {
+        None
+    }
+
+    /// Replaces the whole value with one built from `value` ([`Typed::from_reflect`]). `apply` uses it where a
+    /// value cannot be changed field by field (an enum that changes variant). The default written by
+    /// [`impl_reflect_boilerplate!`] does that; this default only reports that it is not possible.
+    ///
+    /// # Errors
+    ///
+    /// [`ReflectError::Unsupported`] if no value of this type can be built from `value`.
+    fn try_replace(&mut self, _value: &dyn Reflect) -> Result<(), ReflectError> {
+        Err(ReflectError::unsupported(
+            "replace",
+            self.type_info().path(),
+        ))
+    }
+
+    /// Copies `value` into this value, structurally: structs, tuples and enums of the same variant field by
+    /// field (fields `value` does not have are left alone, fields this value does not have are ignored), lists
+    /// are resized to the length of `value`, maps and sets gain the entries they lack (nothing is removed from
+    /// them), opaque values are replaced by a clone, an enum with another variant is rebuilt with
+    /// [`Reflect::try_replace`]. `value` may be a value of the same type or a dynamic value (a patch).
+    ///
+    /// # Errors
+    ///
+    /// [`ReflectError::KindMismatch`] if the kinds differ, [`ReflectError::LengthMismatch`] for arrays of
+    /// another length, [`ReflectError::TypeMismatch`] if an opaque value is of another type,
+    /// [`ReflectError::Unsupported`] if something cannot be cloned or built. The value may be partly changed
+    /// when an error is returned.
+    fn apply(&mut self, value: &dyn Reflect) -> Result<(), ReflectError> {
+        crate::ops::apply(self.as_reflect_mut(), value)
+    }
+
+    /// A deep structural clone made of dynamic values: structs become `DynamicStruct`, lists `DynamicList`,
+    /// and so on; opaque values are cloned as they are. Each dynamic value remembers the type it was cloned from
+    /// ([`Reflect::represented_type_info`]). Typical use: a snapshot to [`apply`](Reflect::apply) back later.
+    ///
+    /// # Errors
+    ///
+    /// [`ReflectError::Unsupported`] if an opaque value inside cannot be cloned.
+    fn clone_value(&self) -> Result<Box<dyn Reflect>, ReflectError> {
+        crate::ops::clone_value(self.as_reflect())
+    }
+
+    /// Structural equality: the same kind, the same fields (by name), the same variant, the same items, with
+    /// opaque values compared by their own `PartialEq`. The type is not compared, so a struct equals a dynamic
+    /// clone of itself. `Some(false)` as soon as a difference is found, `None` if an opaque value inside cannot
+    /// be compared and no difference was found. Keys of maps and items of sets are compared through the
+    /// container's own lookup, so a `HashMap` with composite keys does not equal its dynamic clone.
+    fn reflect_eq(&self, other: &dyn Reflect) -> Option<bool> {
+        crate::ops::reflect_eq(self.as_reflect(), other)
+    }
 }
 
 impl dyn Reflect {
@@ -117,6 +187,21 @@ impl dyn Reflect {
     /// The value as a `&mut T`, if it is a `T`.
     pub fn downcast_mut<T: Reflect>(&mut self) -> Option<&mut T> {
         self.as_any_mut().downcast_mut::<T>()
+    }
+
+    /// Moves the value out of the box if it is a `T`, or builds a `T` from it ([`Typed::from_reflect`]) if it is
+    /// another value of the same shape, for example a dynamic value.
+    ///
+    /// # Errors
+    ///
+    /// [`ReflectError::TypeMismatch`] if the value is neither; the value is dropped.
+    pub fn take_or_convert<T: Typed>(self: Box<Self>) -> Result<T, ReflectError> {
+        if self.is::<T>() {
+            return self.take::<T>();
+        }
+        T::from_reflect(&*self).ok_or_else(|| {
+            ReflectError::type_mismatch(T::static_type_info().path(), self.type_info().path())
+        })
     }
 
     /// Moves the value out of the box, if it is a `T`.
@@ -148,10 +233,21 @@ pub trait Typed: Reflect + Sized {
     /// default adds none. The derive writes it from `#[reflect(Default, Clone, ...)]`; the standard types
     /// override it.
     fn register_type_data(_registration: &mut TypeRegistration) {}
+
+    /// Builds a value of this type from a reflected value of the same shape: a value of this type, or a dynamic
+    /// value (`DynamicStruct`, ...) that has the fields, items or variant this type needs. Fields it lacks are
+    /// an error unless the derive was told `#[reflect(default)]` for them; skipped fields are `Default`.
+    ///
+    /// The derive and the standard types implement it. The default returns `None`: types written by hand, and
+    /// types that opted out with `#[reflect(no_from_reflect)]`, cannot be built from a reflected value, and
+    /// lists, maps and enums that hold them cannot grow from dynamic values.
+    fn from_reflect(_value: &dyn Reflect) -> Option<Self> {
+        None
+    }
 }
 
 /// Writes the methods of a [`Reflect`] implementation that are the same for every type: `type_info`,
-/// the six conversions and `set`. The type must implement [`Typed`].
+/// the six conversions, `set` and `try_replace`. The type must implement [`Typed`].
 ///
 /// ```
 /// use reflection::{
@@ -216,6 +312,24 @@ macro_rules! impl_reflect_boilerplate {
 
         fn into_reflect(self: ::std::boxed::Box<Self>) -> ::std::boxed::Box<dyn $crate::Reflect> {
             self
+        }
+
+        fn try_replace(
+            &mut self,
+            value: &dyn $crate::Reflect,
+        ) -> ::std::result::Result<(), $crate::ReflectError> {
+            match <Self as $crate::Typed>::from_reflect(value) {
+                ::std::option::Option::Some(new) => {
+                    *self = new;
+                    ::std::result::Result::Ok(())
+                }
+                ::std::option::Option::None => {
+                    ::std::result::Result::Err($crate::ReflectError::unsupported(
+                        "build from a reflected value",
+                        <Self as $crate::Typed>::static_type_info().path(),
+                    ))
+                }
+            }
         }
 
         fn set(

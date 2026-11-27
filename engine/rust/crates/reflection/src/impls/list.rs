@@ -20,6 +20,13 @@ impl<T: Typed> Typed for Vec<T> {
     fn register_type_data(registration: &mut TypeRegistration) {
         registration.insert_data(<ReflectDefault as FromType<Self>>::from_type());
     }
+
+    fn from_reflect(value: &dyn Reflect) -> Option<Self> {
+        crate::ops::sequence_items(value)?
+            .into_iter()
+            .map(T::from_reflect)
+            .collect()
+    }
 }
 
 impl<T: Typed> Reflect for Vec<T> {
@@ -50,7 +57,7 @@ impl<T: Typed> List for Vec<T> {
     }
 
     fn push(&mut self, value: Box<dyn Reflect>) -> Result<(), ReflectError> {
-        let value = value.take::<T>()?;
+        let value = value.take_or_convert::<T>()?;
         Vec::push(self, value);
         Ok(())
     }
@@ -60,7 +67,7 @@ impl<T: Typed> List for Vec<T> {
         if index > len {
             return Err(ReflectError::index_out_of_bounds(index, len));
         }
-        let value = value.take::<T>()?;
+        let value = value.take_or_convert::<T>()?;
         Vec::insert(self, index, value);
         Ok(())
     }
@@ -92,6 +99,14 @@ impl<T: Typed, const N: usize> Typed for [T; N] {
             let key = TypeKey::from_owned(&format!("[{};{}]", T::static_type_info().path(), N));
             TypeInfo::Array(ArrayInfo::new::<Self>(key, TypeRef::of::<T>(), N))
         })
+    }
+
+    fn from_reflect(value: &dyn Reflect) -> Option<Self> {
+        let items: Vec<T> = crate::ops::sequence_items(value)?
+            .into_iter()
+            .map(T::from_reflect)
+            .collect::<Option<Vec<T>>>()?;
+        items.try_into().ok()
     }
 }
 

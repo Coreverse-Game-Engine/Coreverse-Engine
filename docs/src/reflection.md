@@ -2,15 +2,14 @@
 
 `engine/rust/crates/reflection` is the engine's runtime type information: what a type is, what it is made of, and
 a way to read and change values without knowing their type at compile time. It is being built in milestones; this
-page describes what exists (R1, the core model, R2, `#[derive(Reflect)]`, and R3, the type registry and type data)
-and what is planned. The crate uses `std`, `utilities` (the name
+page describes what exists (R1, the core model, R2, `#[derive(Reflect)]`, R3, the type registry and type data, and
+R4, paths, `apply`, structural clone and equality, dynamic values and `from_reflect`) and what is planned. The crate uses `std`, `utilities` (the name
 hash and poison-tolerant locks) and `ccore` (`ReflectError` converts into `CoreError`), and contains no `unsafe`
 code.
 
-> **Verification status.** R1, R2 and R3 were written in a sandbox without a Rust toolchain. They have not been
-> compiled, linted or tested yet. Run `cargo fmt --all`, `cargo clippy -p reflection -p reflection-macros
-> --all-targets`, `cargo test -p reflection -p reflection-macros` and `cargo doc -p reflection --no-deps` before
-> merging.
+> **Verification status.** R1, R2 and R3 were verified by the maintainer (`cargo fmt`, `cargo clippy --workspace
+> --all-features --all-targets -- -D warnings`, `cargo test`, Miri). R4 was written in a sandbox without a Rust
+> toolchain and has not been compiled, linted or tested yet: run the same four commands before merging.
 
 ## What is there (R1)
 
@@ -55,7 +54,8 @@ fields; `[T; N]`; `Vec<T>`; `Option<T>` (an enum with the variants `None` and `S
 * **Reflection does not serialize.** It only describes and gives access; formats belong to the `serialization`
   crate, which will walk values through the visitor of R5.
 * **`Debug`, `Clone`, `PartialEq`, `Default` and `Hash` of reflected values** go through the type data of R3, not
-  through the `Reflect` trait; structural versions (`reflect_eq`, `clone_value`) come with R4.
+  through the `Reflect` trait; the structural versions (`reflect_eq`, `clone_value`, `apply`) of R4 work without a
+  registry.
 
 ## Deriving (R2)
 
@@ -97,10 +97,11 @@ Derive-specific decisions:
 * The output is plain safe code: `match` on the field name or index, `&self.field as &dyn Reflect`; enum variants
   are matched with `Self::Variant(..)` patterns, and every `match self` has one arm per variant (no wildcard).
 * Aliases are accepted by `field`/`field_mut` but not by `name_at` or the description's own lookups
-  (`StructInfo::field`), which use the real name. A derive does not generate `Default`: skipped fields are
-  restored by `FromReflect` in R4, which will need `Default` or a `#[reflect(default)]` for them.
-* Changing the variant of an enum in place is still not possible; `set` replaces the whole value (R4 adds dynamic
-  values).
+  (`StructInfo::field`), which use the real name. A derive does not generate `Default`; the `Typed::from_reflect` it
+  writes (R4) fills skipped fields with `Default::default()`, so a skipped field has to be `Default` or the type has
+  to opt out with `#[reflect(no_from_reflect)]`; `#[reflect(default)]` on a field does the same for a field the
+  source lacks.
+* An enum cannot change its variant in place; `apply` rebuilds the value with `Reflect::try_replace` (R4) instead.
 
 ## The registry and type data (R3)
 
@@ -139,10 +140,49 @@ Registry-specific decisions:
   checks all of them against the registry and against each other, and only then inserts them.
 * **Deterministic inventory.** `from_inventory` sorts the submitted types by path before registering them, so the
   same program reports the same conflict every time (the linker's order is not stable).
-* **Aliases resolve in `get_by_path` and `create_default`**, nowhere else yet (paths and `apply` come in R4).
+* **Aliases resolve in `get_by_path`, `create_default` and `from_reflect` of the registry, and in `field`/`field_mut` of
+  derived types** (so in paths and `apply` too); the descriptions' own lookups use the real name.
 * **Type data is registered, not discovered.** A type is only as capable as its registration says; nothing
   checks that `#[reflect(Clone)]` was written for a type that is `Clone` except the compiler (it would not
   compile otherwise).
+
+## Paths, apply, clone, equality, dynamic values (R4)
+
+| Item | Purpose |
+|:-----|:--------|
+| `ReflectPath`, `PathSegment` | A parsed path: `stats.health`, `items[2].0`, `pos.1`, `boss.0.0.name`. `.name` is a field by name (structs and struct variants), `.0` a field by position (tuples, tuple structs, tuple variants; an `Option<T>` or `Box<T>` is `.0`), `[2]` an item of a list or array. No syntax for map entries. `parse` reports the byte position of a problem (`InvalidPath`); `reflect` and `reflect_mut` walk a value and say which segment did not fit (`PathMismatch { segment, reason }`). |
+| `GetPath` | Implemented for every `Reflect` type, concrete or `dyn Reflect`: `reflect_path`, `reflect_path_mut`, `get_path::<T>`, `get_path_mut::<T>`, `set_path`. |
+| `Reflect::apply(&dyn Reflect)` | Structural copy. Structs, tuples, tuple structs and enums of the same variant field by field (fields the source lacks stay, fields the target lacks are ignored); lists are resized to the source length; arrays must have the same length (`LengthMismatch`); maps and sets gain what they lack but **lose nothing**; opaque values are replaced by a clone; an enum with another variant is rebuilt with `try_replace`. The source may be a value of the same type or a dynamic value, so a patch can be a `DynamicStruct` with only the fields to change. Different kinds are a `KindMismatch`. An error can leave the value partly changed. |
+| `Reflect::try_replace(&dyn Reflect)` | Replaces the whole value with `Typed::from_reflect(value)`; written by `impl_reflect_boilerplate!`. Restores a snapshot exactly, maps and sets included. |
+| `Reflect::clone_value()` | Deep structural clone made of dynamic values (structs become `DynamicStruct`, lists `DynamicList`, and so on, a `Box<T>` a `DynamicTupleStruct`); opaque values are cloned as they are. Each dynamic value remembers the type it was cloned from (`represented_type_info()`). |
+| `Reflect::reflect_eq(&dyn Reflect)` | Structural equality, `Option<bool>`: `Some(false)` at the first difference, `None` if an opaque value inside cannot be compared and no difference was found. The type is not compared (a struct equals its dynamic clone, and `A { x: 1 }` equals `B { x: 1 }`). NaN is not equal to itself. Map keys and set items are looked up through the other container, so a `HashMap` with composite keys does not equal its dynamic clone. |
+| `Reflect::opaque_clone`, `opaque_eq` | What `clone_value`, `apply` and `reflect_eq` use on opaque leaves. The standard opaque types implement them; a hand-written opaque type that is `Clone`/`PartialEq` should too (the default is `None`: not cloneable, not comparable). |
+| `Typed::from_reflect(&dyn Reflect) -> Option<Self>` | Builds a concrete value from a reflected value of the same shape (this is the `FromReflect` of the plan, a provided method of `Typed` rather than a separate trait: containers use it without extra bounds). The derive and the standard types implement it; the default returns `None`. Lists, maps, sets, `Option` and `Box` convert their items with it, which is how dynamic values become concrete values inside `push`, `insert` and `apply`. |
+| `ReflectFromReflect` | Type data with the same function, in every `TypeRegistration`; `TypeRegistry::from_reflect(name, &value)` builds a value by type name (`Unsupported` if the type cannot be built). |
+| `DynamicStruct`, `DynamicTupleStruct`, `DynamicTuple`, `DynamicEnum` (+ `DynamicVariant`), `DynamicList`, `DynamicArray`, `DynamicMap`, `DynamicSet` | Values built at run time. They implement the kind traits, so everything above works on them. Their `TypeInfo` is an opaque `"DynamicStruct"` and so on (what they look like is only known at run time); `kind()` and `reflect_ref()` say what they behave like. Maps and sets find keys with `reflect_eq`. |
+| `ReflectError` | New variants `InvalidPath`, `PathMismatch`, `KindMismatch`, `LengthMismatch`, `Unsupported { operation, path }`. |
+
+On the derive: it writes `Typed::from_reflect` unless the type says `#[reflect(no_from_reflect)]`. Fields are built with
+`from_reflect` of their types and looked up by name or alias (tuple fields and tuple variants by position), an enum
+picks its variant by name or alias, skipped fields get `Default::default()`, and `#[reflect(default)]` on a field uses
+`Default::default()` when the source has no such field (a field that is there but of the wrong type is still an
+error). A type with a skipped field that is not `Default` has to say `no_from_reflect`; such a type cannot be built
+from a reflected value, and containers of it cannot grow from dynamic values.
+
+R4-specific decisions:
+
+* **Leaf operations are trait methods.** Cloning or comparing an opaque value from a `&dyn Reflect` needs the type's
+  `Clone`/`PartialEq`, which the object-safe trait cannot see, so `opaque_clone` and `opaque_eq` are provided methods
+  with a `None` default and the standard types override them. This is why `apply`, `clone_value` and `reflect_eq` need
+  no registry.
+* **`from_reflect` lives on `Typed`.** A separate `FromReflect` trait would have needed `T: FromReflect` bounds on
+  every container implementation and on every derived generic type; a provided method keeps all of R1 to R3 as it was.
+* **Maps and sets are patched, not mirrored.** `apply` adds and updates entries but never removes them, so a patch
+  can leave a map alone. Use `try_replace` with a snapshot for an exact restore.
+* **Dynamic names are interned.** The kind traits return `&'static str` names, so `DynamicStruct` and `DynamicEnum`
+  intern the names given to them (leaked once per distinct name). Do not feed untrusted, unbounded names to them; a
+  deserializer should take names from the type's description.
+* **Dynamic enums cannot switch variant themselves.** `try_replace` on a dynamic value reports `Unsupported`.
 
 ## Example
 
@@ -163,7 +203,8 @@ assert_eq!(numbers, [1, 2, 3]);
 `crates/reflection/tests/hand_written.rs` shows what a hand-written implementation looks like (a `Typed` impl with a
 `TypeInfoCell`, a `Reflect` impl that starts with `impl_reflect_boilerplate!()`, and a `Struct` impl) for a struct
 with five fields and a recursive `Node`; `tests/derive.rs` covers the derive: structs, tuple and unit structs, enums,
-generics, paths, aliases and skipped fields, recursive types, containers of derived types; `tests/registry.rs` and
+generics, paths, aliases and skipped fields, recursive types, containers of derived types; `tests/path.rs`,
+`tests/apply.rs` and `tests/clone_eq.rs` cover R4; `tests/registry.rs` and
 `tests/registry_conflicts.rs` cover the registry, type data and name conflicts (every integration test file is its own
 program, so each has its own `inventory`).
 
@@ -174,7 +215,7 @@ program, so each has its own `inventory`).
 | R1 | The core model. Implemented. |
 | R2 | `reflection-macros` (`engine/rust/macros`): `#[derive(Reflect)]` for structs, tuple structs, unit structs, enums and generics; `skip`, `name`, `alias`, `rename`. Implemented. |
 | R3 | `TypeRegistry` (lookup by key, name and alias; collision errors), automatic collection with `inventory`, `TypeData` (`ReflectDefault`, `ReflectClone`, `ReflectPartialEq`, `ReflectDebug`, `ReflectHash`). Implemented. |
-| R4 | Paths (`a.b[2].c`), `apply`, `clone_value`, `reflect_eq`, dynamic values and `FromReflect`. |
+| R4 | Paths (`a.b[2].c`), `apply`, `clone_value`, `reflect_eq`, dynamic values and `FromReflect`. Implemented. |
 | R5 | Field and type metadata (range, tooltip, category, readonly, hidden, transient, custom attributes) and a visitor. |
 | R6 | Engine types behind features (`math`, `ccore` ids, `Version`, `Handle`), `Arc` and `Cow`, edge cases. |
 | R7 | `registry.validate()`, diagnostics (optional `logging` feature), text and JSON schema export, an optional FFI surface for the editor. |

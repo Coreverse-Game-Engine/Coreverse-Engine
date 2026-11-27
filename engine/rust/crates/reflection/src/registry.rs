@@ -8,7 +8,7 @@ use crate::error::ReflectError;
 use crate::info::TypeInfo;
 use crate::key::TypeKey;
 use crate::reflect::{Reflect, Typed};
-use crate::type_data::{ReflectClone, ReflectDefault, TypeData};
+use crate::type_data::{FromType, ReflectClone, ReflectDefault, ReflectFromReflect, TypeData};
 
 /// One registered type: its description and its type data.
 pub struct TypeRegistration {
@@ -25,10 +25,11 @@ impl TypeRegistration {
         }
     }
 
-    /// A registration of `T`: its description and the type data `T` asks for
+    /// A registration of `T`: its description, a [`ReflectFromReflect`] and the type data `T` asks for
     /// ([`Typed::register_type_data`]).
     pub fn of<T: Typed>() -> Self {
         let mut registration = Self::new(T::static_type_info());
+        registration.insert_data(<ReflectFromReflect as FromType<T>>::from_type());
         T::register_type_data(&mut registration);
         registration
     }
@@ -327,6 +328,36 @@ impl TypeRegistry {
                     data: "ReflectDefault",
                 })?;
         Ok(default.create())
+    }
+
+    /// A value of the type with the given path or alias, built from `value` (a value of that type or a
+    /// dynamic value of the same shape) with the type's [`ReflectFromReflect`].
+    ///
+    /// # Errors
+    ///
+    /// [`ReflectError::UnknownType`] if no such type is registered, [`ReflectError::Unsupported`] if a value of
+    /// the type cannot be built from `value`.
+    pub fn from_reflect(
+        &self,
+        name: &str,
+        value: &dyn Reflect,
+    ) -> Result<Box<dyn Reflect>, ReflectError> {
+        let registration = self
+            .get_by_path(name)
+            .ok_or_else(|| ReflectError::UnknownType {
+                name: name.to_string(),
+            })?;
+        let builder =
+            registration
+                .data::<ReflectFromReflect>()
+                .ok_or(ReflectError::MissingTypeData {
+                    path: registration.path(),
+                    data: "ReflectFromReflect",
+                })?;
+        builder.from_reflect(value).ok_or(ReflectError::unsupported(
+            "build from a reflected value",
+            registration.path(),
+        ))
     }
 
     /// A clone of `value`, made with the [`ReflectClone`] of its type.

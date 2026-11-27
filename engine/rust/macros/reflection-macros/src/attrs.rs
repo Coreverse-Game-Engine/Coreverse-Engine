@@ -10,12 +10,16 @@ pub(crate) struct ContainerAttrs {
     /// Type data to register: `Default`, `Clone`, `PartialEq`, `Debug`, `Hash` or the path of a type that
     /// implements `FromType`.
     pub(crate) data: Vec<Path>,
+    /// `no_from_reflect`: do not write `Typed::from_reflect`.
+    pub(crate) no_from_reflect: bool,
 }
 
 /// `#[reflect(...)]` on a field.
 #[derive(Default)]
 pub(crate) struct FieldAttrs {
     pub(crate) skip: bool,
+    /// `default`: `from_reflect` uses `Default::default()` when the source has no such field.
+    pub(crate) default: bool,
     pub(crate) rename: Option<LitStr>,
     pub(crate) aliases: Vec<LitStr>,
 }
@@ -52,6 +56,9 @@ pub(crate) fn container(attrs: &[Attribute]) -> Result<ContainerAttrs> {
             } else if meta.path.is_ident("alias") {
                 out.aliases.push(string_value!(meta));
                 Ok(())
+            } else if meta.path.is_ident("no_from_reflect") {
+                out.no_from_reflect = true;
+                Ok(())
             } else if meta
                 .path
                 .segments
@@ -62,7 +69,7 @@ pub(crate) fn container(attrs: &[Attribute]) -> Result<ContainerAttrs> {
                 Ok(())
             } else {
                 Err(meta.error(
-                    "unsupported `reflect` attribute on a type; expected `name = \"...\"`, `alias = \"...\"` or the name of a type data (`Default`, `Clone`, `PartialEq`, `Debug`, `Hash`, or a type that implements `FromType`)",
+                    "unsupported `reflect` attribute on a type; expected `name = \"...\"`, `alias = \"...\"`, `no_from_reflect` or the name of a type data (`Default`, `Clone`, `PartialEq`, `Debug`, `Hash`, or a type that implements `FromType`)",
                 ))
             }
         })?;
@@ -77,6 +84,9 @@ pub(crate) fn field(attrs: &[Attribute]) -> Result<FieldAttrs> {
             if meta.path.is_ident("skip") {
                 out.skip = true;
                 Ok(())
+            } else if meta.path.is_ident("default") {
+                out.default = true;
+                Ok(())
             } else if meta.path.is_ident("rename") {
                 if out.rename.is_some() {
                     return Err(meta.error("`rename` is given twice"));
@@ -88,7 +98,7 @@ pub(crate) fn field(attrs: &[Attribute]) -> Result<FieldAttrs> {
                 Ok(())
             } else {
                 Err(meta.error(
-                    "unsupported `reflect` attribute on a field; expected `skip`, `rename = \"...\"` or `alias = \"...\"`",
+                    "unsupported `reflect` attribute on a field; expected `skip`, `default`, `rename = \"...\"` or `alias = \"...\"`",
                 ))
             }
         })?;

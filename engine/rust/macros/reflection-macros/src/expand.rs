@@ -128,6 +128,8 @@ struct Field<'a> {
     /// The reflected name; `None` for the fields of tuples.
     name: Option<String>,
     aliases: Vec<String>,
+    /// `#[reflect(default)]`: `from_reflect` may use `Default::default()` when the source lacks the field.
+    default: bool,
 }
 
 impl Field<'_> {
@@ -180,6 +182,7 @@ fn collect_fields(fields: &Fields) -> Result<Vec<Field<'_>>> {
     for (position, field) in fields.iter().enumerate() {
         let attrs::FieldAttrs {
             skip,
+            default,
             rename,
             aliases,
         } = attrs::field(&field.attrs)?;
@@ -218,6 +221,7 @@ fn collect_fields(fields: &Fields) -> Result<Vec<Field<'_>>> {
             ty: &field.ty,
             name,
             aliases,
+            default,
         });
     }
     Ok(out)
@@ -260,6 +264,7 @@ fn assemble(
     reflect_kind: &Ident,
     kind_trait: &TokenStream,
     kind_body: &TokenStream,
+    from_reflect: &TokenStream,
     container: &ContainerAttrs,
 ) -> TokenStream {
     let ident = &input.ident;
@@ -310,6 +315,8 @@ fn assemble(
             }
 
             #register_hook
+
+            #from_reflect
         }
 
         #[automatically_derived]
@@ -331,6 +338,98 @@ fn assemble(
         }
 
         #submit
+    }
+}
+
+/// `view.field("a").or_else(|| view.field("old"))`: the field called `name` or one of its aliases.
+fn lookup_by_name(field: &Field<'_>) -> TokenStream {
+    let all = field.names();
+    let Some((first, rest)) = all.split_first() else {
+        return quote!(::core::option::Option::None);
+    };
+    let mut expr = quote!(view.field(#first));
+    for alias in rest {
+        expr = quote!(#expr.or_else(|| view.field(#alias)));
+    }
+    expr
+}
+
+/// The expression that builds a field from the reflected field `lookup` finds: `from_reflect` of its type,
+/// or `Default::default()` when the field is `default` and the source lacks it.
+fn field_value(field: &Field<'_>, lookup: &TokenStream) -> TokenStream {
+    let ty = field.ty;
+    if field.default {
+        quote! {
+            match #lookup {
+                ::core::option::Option::Some(found) => {
+                    <#ty as ::reflection::Typed>::from_reflect(found)?
+                }
+                ::core::option::Option::None => ::core::default::Default::default(),
+            }
+        }
+    } else {
+        quote!(<#ty as ::reflection::Typed>::from_reflect(#lookup?)?)
+    }
+}
+
+/// The expression that builds `path` (a struct or a variant) with the given declared `fields`: reflected ones
+/// from `lookup(reflected index, field)`, skipped ones with `Default::default()`.
+fn construct(
+    path: &TokenStream,
+    fields: &Fields,
+    reflected: &[Field<'_>],
+    lookup: impl Fn(usize, &Field<'_>) -> TokenStream,
+) -> TokenStream {
+    let values: Vec<TokenStream> = (0..fields.len())
+        .map(|position| {
+            match reflected
+                .iter()
+                .enumerate()
+                .find(|(_, field)| field.position == position)
+            {
+                Some((index, field)) => field_value(field, &lookup(index, field)),
+                None => quote!(::core::default::Default::default()),
+            }
+        })
+        .collect();
+    match fields {
+        Fields::Named(_) => {
+            let idents: Vec<&Ident> = fields
+                .iter()
+                .filter_map(|field| field.ident.as_ref())
+                .collect();
+            quote!(#path { #(#idents: #values),* })
+        }
+        Fields::Unnamed(_) => quote!(#path(#(#values),*)),
+        Fields::Unit => quote!(#path),
+    }
+}
+
+/// `Typed::from_reflect` for a struct or a tuple struct.
+fn struct_from_reflect(fields: &Fields, reflected: &[Field<'_>]) -> TokenStream {
+    let tuple = matches!(fields, Fields::Unnamed(_));
+    let value = construct(&quote!(Self), fields, reflected, |index, field| {
+        if tuple {
+            quote!(view.field(#index))
+        } else {
+            lookup_by_name(field)
+        }
+    });
+    let kind = if tuple {
+        quote!(TupleStruct)
+    } else {
+        quote!(Struct)
+    };
+    quote! {
+        fn from_reflect(value: &dyn ::reflection::Reflect) -> ::core::option::Option<Self> {
+            let ::reflection::ReflectRef::#kind(view) =
+                ::reflection::Reflect::reflect_ref(value)
+            else {
+                return ::core::option::Option::None;
+            };
+            let _ = view;
+            ::core::option::Option::Some(#value)
+        }
     }
 }
 
@@ -401,6 +500,11 @@ fn expand_struct(
                 #exclusive
             }
         };
+        let from_reflect = if container.no_from_reflect {
+            quote!()
+        } else {
+            struct_from_reflect(&data.fields, &fields)
+        };
         let kind = format_ident!("TupleStruct");
         return Ok(assemble(
             input,
@@ -408,6 +512,7 @@ fn expand_struct(
             &kind,
             &quote!(::reflection::TupleStruct),
             &body,
+            &from_reflect,
             container,
         ));
     }
@@ -497,6 +602,11 @@ fn expand_struct(
             #field_at_mut
         }
     };
+    let from_reflect = if container.no_from_reflect {
+        quote!()
+    } else {
+        struct_from_reflect(&data.fields, &fields)
+    };
     let kind = format_ident!("Struct");
     Ok(assemble(
         input,
@@ -504,6 +614,7 @@ fn expand_struct(
         &kind,
         &quote!(::reflection::Struct),
         &body,
+        &from_reflect,
         container,
     ))
 }
@@ -524,6 +635,8 @@ struct Variant<'a> {
     kind: Kind,
     /// The number of fields, skipped ones included.
     total: usize,
+    /// The declared fields, skipped ones included.
+    syn_fields: &'a Fields,
     fields: Vec<Field<'a>>,
 }
 
@@ -641,6 +754,7 @@ fn collect_variants(data: &DataEnum) -> Result<Vec<Variant<'_>>> {
             aliases,
             kind,
             total: variant.fields.len(),
+            syn_fields: &variant.fields,
             fields: collect_fields(&variant.fields)?,
         });
     }
@@ -666,6 +780,45 @@ fn arms_for(
             }
         })
         .collect()
+}
+
+/// `Typed::from_reflect` for an enum: pick the variant by name or alias, then build its fields.
+fn enum_from_reflect(variants: &[Variant<'_>]) -> TokenStream {
+    let arms: Vec<TokenStream> = variants
+        .iter()
+        .map(|variant| {
+            let ident = variant.ident;
+            let tuple = variant.kind == Kind::Tuple;
+            let value = construct(
+                &quote!(Self::#ident),
+                variant.syn_fields,
+                &variant.fields,
+                |index, field| {
+                    if tuple {
+                        quote!(view.field_at(#index))
+                    } else {
+                        lookup_by_name(field)
+                    }
+                },
+            );
+            let names: Vec<&String> = std::iter::once(&variant.name)
+                .chain(variant.aliases.iter())
+                .collect();
+            quote!(#(#names)|* => ::core::option::Option::Some(#value))
+        })
+        .collect();
+    quote! {
+        fn from_reflect(value: &dyn ::reflection::Reflect) -> ::core::option::Option<Self> {
+            let ::reflection::ReflectRef::Enum(view) = ::reflection::Reflect::reflect_ref(value)
+            else {
+                return ::core::option::Option::None;
+            };
+            match view.variant_name() {
+                #(#arms,)*
+                _ => ::core::option::Option::None,
+            }
+        }
+    }
 }
 
 fn expand_enum(
@@ -861,6 +1014,11 @@ fn expand_enum(
             }
         }
     };
+    let from_reflect = if container.no_from_reflect {
+        quote!()
+    } else {
+        enum_from_reflect(&variants)
+    };
     let kind = format_ident!("Enum");
     Ok(assemble(
         input,
@@ -868,6 +1026,7 @@ fn expand_enum(
         &kind,
         &quote!(::reflection::Enum),
         &body,
+        &from_reflect,
         container,
     ))
 }
@@ -948,6 +1107,31 @@ mod tests {
     }
 
     #[test]
+    fn from_reflect_is_written_unless_opted_out() {
+        let (_, text) = expand_source("struct S { a: u8 }").unwrap();
+        assert!(text.contains("from_reflect"));
+        let (_, text) = expand_source("struct S(u8, u16);").unwrap();
+        assert!(text.contains("from_reflect"));
+        let (_, text) = expand_source("enum E { A, B(u8), C { x: u8 } }").unwrap();
+        assert!(text.contains("from_reflect"));
+        assert!(text.contains("variant_name"));
+        let (_, text) = expand_source("#[reflect(no_from_reflect)] struct S { a: u8 }").unwrap();
+        assert!(!text.contains("from_reflect"));
+    }
+
+    #[test]
+    fn default_and_skipped_fields_use_default() {
+        let (_, text) =
+            expand_source("struct S { #[reflect(default)] a: u8, #[reflect(skip)] b: u8, c: u8 }")
+                .unwrap();
+        assert!(text.contains("Default"));
+        let (_, text) = expand_source("struct S(u8, #[reflect(skip)] u8);").unwrap();
+        assert!(text.contains("Default"));
+        let (_, text) = expand_source("struct S { a: u8 }").unwrap();
+        assert!(!text.contains("Default"));
+    }
+
+    #[test]
     fn generics_get_typed_bounds() {
         let (_, text) = expand_source("struct Pair<A, B> { a: A, b: B }").unwrap();
         assert!(text.contains("GenericTypeInfoCell"));
@@ -992,6 +1176,10 @@ mod tests {
         assert!(error_of("enum E { #[reflect(skip)] A }").contains("unsupported"));
         assert!(error_of("#[reflect(alias = \"x\")] struct S<T> { a: T }").contains("generic"));
         assert!(error_of("#[reflect(Default)] struct S<T> { a: T }").contains("generic"));
+        assert!(error_of("struct S { #[reflect(default = 1)] a: u8 }").contains("expected"));
+        assert!(
+            error_of("#[reflect(no_from_reflect = 1)] struct S { a: u8 }").contains("expected")
+        );
         assert!(error_of("#[reflect(Default = 1)] struct S { a: u8 }").contains("expected"));
         assert!(error_of("struct S(#[reflect(rename = \"x\")] u8);").contains("name"));
         assert!(error_of("#[reflect(name = \"\")] struct S { a: u8 }").contains("empty"));

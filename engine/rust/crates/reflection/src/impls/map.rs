@@ -31,6 +31,17 @@ impl<K: Typed + Hash + Eq, V: Typed> Typed for HashMap<K, V> {
     fn register_type_data(registration: &mut TypeRegistration) {
         registration.insert_data(<ReflectDefault as FromType<Self>>::from_type());
     }
+
+    fn from_reflect(value: &dyn Reflect) -> Option<Self> {
+        let ReflectRef::Map(view) = value.reflect_ref() else {
+            return None;
+        };
+        let mut map: HashMap<K, V> = HashMap::new();
+        for (key, item) in view.iter() {
+            HashMap::insert(&mut map, K::from_reflect(key)?, V::from_reflect(item)?);
+        }
+        Some(map)
+    }
 }
 
 impl<K: Typed + Hash + Eq, V: Typed> Reflect for HashMap<K, V> {
@@ -65,8 +76,8 @@ impl<K: Typed + Hash + Eq, V: Typed> Map for HashMap<K, V> {
         key: Box<dyn Reflect>,
         value: Box<dyn Reflect>,
     ) -> Result<Option<Box<dyn Reflect>>, ReflectError> {
-        let key = key.take::<K>()?;
-        let value = value.take::<V>()?;
+        let key = key.take_or_convert::<K>()?;
+        let value = value.take_or_convert::<V>()?;
         Ok(HashMap::insert(self, key, value).map(|old| Box::new(old) as Box<dyn Reflect>))
     }
 
@@ -106,6 +117,17 @@ impl<K: Typed + Ord, V: Typed> Typed for BTreeMap<K, V> {
     fn register_type_data(registration: &mut TypeRegistration) {
         registration.insert_data(<ReflectDefault as FromType<Self>>::from_type());
     }
+
+    fn from_reflect(value: &dyn Reflect) -> Option<Self> {
+        let ReflectRef::Map(view) = value.reflect_ref() else {
+            return None;
+        };
+        let mut map: BTreeMap<K, V> = BTreeMap::new();
+        for (key, item) in view.iter() {
+            BTreeMap::insert(&mut map, K::from_reflect(key)?, V::from_reflect(item)?);
+        }
+        Some(map)
+    }
 }
 
 impl<K: Typed + Ord, V: Typed> Reflect for BTreeMap<K, V> {
@@ -140,8 +162,8 @@ impl<K: Typed + Ord, V: Typed> Map for BTreeMap<K, V> {
         key: Box<dyn Reflect>,
         value: Box<dyn Reflect>,
     ) -> Result<Option<Box<dyn Reflect>>, ReflectError> {
-        let key = key.take::<K>()?;
-        let value = value.take::<V>()?;
+        let key = key.take_or_convert::<K>()?;
+        let value = value.take_or_convert::<V>()?;
         Ok(BTreeMap::insert(self, key, value).map(|old| Box::new(old) as Box<dyn Reflect>))
     }
 

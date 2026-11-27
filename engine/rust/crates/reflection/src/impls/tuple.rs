@@ -19,6 +19,16 @@ macro_rules! impl_tuple {
                     ))
                 })
             }
+
+            fn from_reflect(value: &dyn Reflect) -> Option<Self> {
+                let ReflectRef::Tuple(view) = value.reflect_ref() else {
+                    return None;
+                };
+                if view.field_len() != [$($index),+].len() {
+                    return None;
+                }
+                Some(($(<$name as Typed>::from_reflect(view.field($index)?)?,)+))
+            }
         }
 
         impl<$($name: Typed),+> Reflect for ($($name,)+) {
