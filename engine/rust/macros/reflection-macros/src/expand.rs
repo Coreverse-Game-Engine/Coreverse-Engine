@@ -9,7 +9,7 @@ use syn::{
     Path, Result, Type, parse_quote,
 };
 
-use crate::attrs::{self, ContainerAttrs};
+use crate::attrs::{self, ContainerAttrs, MetaAttrs};
 
 /// Expands the derive for one type: the `Typed`, `Reflect` and kind-trait implementations.
 pub(crate) fn derive(input: &DeriveInput) -> Result<TokenStream> {
@@ -130,6 +130,45 @@ struct Field<'a> {
     aliases: Vec<String>,
     /// `#[reflect(default)]`: `from_reflect` may use `Default::default()` when the source lacks the field.
     default: bool,
+    /// The `.with_metadata(..)` call for the `FieldInfo`, or nothing when the field has no metadata.
+    metadata: TokenStream,
+}
+
+/// The `.with_metadata(..)` call that gives a description its metadata; empty tokens when there is none, so
+/// that types without metadata attributes expand exactly as before.
+fn metadata_call(meta: &MetaAttrs, has_default: bool) -> TokenStream {
+    let mut calls: Vec<TokenStream> = Vec::new();
+    if let Some(docs) = &meta.docs {
+        calls.push(quote!(.with_docs(#docs)));
+    }
+    if let Some(tooltip) = &meta.tooltip {
+        calls.push(quote!(.with_tooltip(#tooltip)));
+    }
+    if let Some(category) = &meta.category {
+        calls.push(quote!(.with_category(#category)));
+    }
+    if let Some((min, max)) = &meta.range {
+        calls.push(quote!(.with_range(#min, #max)));
+    }
+    if meta.readonly {
+        calls.push(quote!(.with_readonly()));
+    }
+    if meta.hidden {
+        calls.push(quote!(.with_hidden()));
+    }
+    if meta.transient {
+        calls.push(quote!(.with_transient()));
+    }
+    if has_default {
+        calls.push(quote!(.with_default()));
+    }
+    for value in &meta.custom {
+        calls.push(quote!(.with_custom(#value)));
+    }
+    if calls.is_empty() {
+        return TokenStream::new();
+    }
+    quote!(.with_metadata(::reflection::Metadata::new() #(#calls)*))
 }
 
 impl Field<'_> {
@@ -157,19 +196,20 @@ impl Field<'_> {
     fn info(&self, index: usize) -> TokenStream {
         let ty = self.ty;
         let aliases = &self.aliases;
+        let metadata = &self.metadata;
         match &self.name {
             Some(name) => quote! {
                 ::reflection::FieldInfo::named(
                     #name,
                     #index,
                     ::reflection::TypeRef::of::<#ty>(),
-                ).with_aliases(&[#(#aliases),*])
+                ).with_aliases(&[#(#aliases),*]) #metadata
             },
             None => quote! {
                 ::reflection::FieldInfo::unnamed(
                     #index,
                     ::reflection::TypeRef::of::<#ty>(),
-                )
+                ) #metadata
             },
         }
     }
@@ -185,6 +225,7 @@ fn collect_fields(fields: &Fields) -> Result<Vec<Field<'_>>> {
             default,
             rename,
             aliases,
+            meta,
         } = attrs::field(&field.attrs)?;
         if skip {
             continue;
@@ -222,6 +263,7 @@ fn collect_fields(fields: &Fields) -> Result<Vec<Field<'_>>> {
             name,
             aliases,
             default,
+            metadata: metadata_call(&meta, default),
         });
     }
     Ok(out)
@@ -441,6 +483,7 @@ fn expand_struct(
 ) -> Result<TokenStream> {
     let fields = collect_fields(&data.fields)?;
     let type_aliases: Vec<String> = container.aliases.iter().map(LitStr::value).collect();
+    let type_meta = metadata_call(&container.meta, false);
     let field_infos: Vec<TokenStream> = fields
         .iter()
         .enumerate()
@@ -459,7 +502,7 @@ fn expand_struct(
                         key,
                         ::std::vec![#(#field_infos),*],
                     )
-                    .with_aliases(&[#(#type_aliases),*]),
+                    .with_aliases(&[#(#type_aliases),*]) #type_meta,
                 )
             }
         };
@@ -525,7 +568,7 @@ fn expand_struct(
                     key,
                     ::std::vec![#(#field_infos),*],
                 )
-                .with_aliases(&[#(#type_aliases),*]),
+                .with_aliases(&[#(#type_aliases),*]) #type_meta,
             )
         }
     };
@@ -638,6 +681,8 @@ struct Variant<'a> {
     /// The declared fields, skipped ones included.
     syn_fields: &'a Fields,
     fields: Vec<Field<'a>>,
+    /// The `.with_metadata(..)` call for the `VariantInfo`, or nothing.
+    metadata: TokenStream,
 }
 
 /// The name of the binding of the reflected field at the given position.
@@ -690,6 +735,7 @@ impl Variant<'_> {
         let name = &self.name;
         let index = self.index;
         let aliases = &self.aliases;
+        let metadata = &self.metadata;
         let fields: Vec<TokenStream> = self
             .fields
             .iter()
@@ -699,11 +745,11 @@ impl Variant<'_> {
         match self.kind {
             Kind::Unit => quote! {
                 ::reflection::VariantInfo::unit(#name, #index)
-                    .with_aliases(&[#(#aliases),*])
+                    .with_aliases(&[#(#aliases),*]) #metadata
             },
             Kind::Tuple => quote! {
                 ::reflection::VariantInfo::tuple(#name, #index, ::std::vec![#(#fields),*])
-                    .with_aliases(&[#(#aliases),*])
+                    .with_aliases(&[#(#aliases),*]) #metadata
             },
             Kind::Named => quote! {
                 ::reflection::VariantInfo::with_named_fields(
@@ -711,7 +757,7 @@ impl Variant<'_> {
                     #index,
                     ::std::vec![#(#fields),*],
                 )
-                .with_aliases(&[#(#aliases),*])
+                .with_aliases(&[#(#aliases),*]) #metadata
             },
         }
     }
@@ -729,7 +775,11 @@ fn collect_variants(data: &DataEnum) -> Result<Vec<Variant<'_>>> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for (index, variant) in data.variants.iter().enumerate() {
-        let attrs::VariantAttrs { rename, aliases } = attrs::variant(&variant.attrs)?;
+        let attrs::VariantAttrs {
+            rename,
+            aliases,
+            meta,
+        } = attrs::variant(&variant.attrs)?;
         let name = rename
             .as_ref()
             .map_or_else(|| plain_name(&variant.ident), LitStr::value);
@@ -756,6 +806,7 @@ fn collect_variants(data: &DataEnum) -> Result<Vec<Variant<'_>>> {
             total: variant.fields.len(),
             syn_fields: &variant.fields,
             fields: collect_fields(&variant.fields)?,
+            metadata: metadata_call(&meta, false),
         });
     }
     Ok(out)
@@ -835,6 +886,7 @@ fn expand_enum(
     }
     let variants = collect_variants(data)?;
     let type_aliases: Vec<String> = container.aliases.iter().map(LitStr::value).collect();
+    let type_meta = metadata_call(&container.meta, false);
     let variant_infos: Vec<TokenStream> = variants.iter().map(Variant::info).collect();
     let info = quote! {
         {
@@ -844,7 +896,7 @@ fn expand_enum(
                     key,
                     ::std::vec![#(#variant_infos),*],
                 )
-                .with_aliases(&[#(#type_aliases),*]),
+                .with_aliases(&[#(#type_aliases),*]) #type_meta,
             )
         }
     };
@@ -1190,5 +1242,79 @@ mod tests {
         assert!(error_of("struct S { a: u8, #[reflect(rename = \"a\")] b: u8 }").contains("twice"));
         assert!(error_of("struct S { a: u8, #[reflect(alias = \"a\")] b: u8 }").contains("twice"));
         assert!(error_of("enum E { A, #[reflect(rename = \"A\")] B }").contains("twice"));
+    }
+
+    #[test]
+    fn metadata_attributes_are_expanded() {
+        let (_, text) = expand_source(
+            "#[reflect(category = \"Gameplay\", transient, attr = Marker { id: 1 })] \
+             struct Hero { \
+             #[reflect(tooltip = \"Hit points\", range(min = 0.0, max = 100.0), readonly, hidden)] hp: f32, \
+             #[reflect(default)] mana: u32 }",
+        )
+        .unwrap();
+        assert!(text.contains("with_metadata"));
+        assert!(text.contains("with_category"));
+        assert!(text.contains("with_transient"));
+        assert!(text.contains("with_custom"));
+        assert!(text.contains("with_tooltip"));
+        assert!(text.contains("with_range"));
+        assert!(text.contains("with_readonly"));
+        assert!(text.contains("with_hidden"));
+        assert!(text.contains("with_default"));
+    }
+
+    #[test]
+    fn variants_take_their_own_metadata() {
+        let (_, text) = expand_source(
+            "enum E { #[reflect(tooltip = \"Idle\", category = \"State\", hidden, attr = 5u8)] A, B(u8) }",
+        )
+        .unwrap();
+        assert!(text.contains("with_tooltip"));
+        assert!(text.contains("with_category"));
+        assert!(text.contains("with_custom"));
+    }
+
+    #[test]
+    fn no_metadata_means_no_metadata_call() {
+        let (_, text) = expand_source("struct S { a: u8 }").unwrap();
+        assert!(!text.contains("with_metadata"));
+        let (_, text) = expand_source("enum E { A, B }").unwrap();
+        assert!(!text.contains("with_metadata"));
+    }
+
+    #[test]
+    fn metadata_attributes_are_checked() {
+        // `range` only on fields
+        assert!(error_of("#[reflect(range(min = 0, max = 1))] struct S { a: u8 }").contains("unsupported"));
+        assert!(error_of("enum E { #[reflect(range(min = 0, max = 1))] A }").contains("unsupported"));
+        // `readonly` and `transient` not on variants
+        assert!(error_of("enum E { #[reflect(readonly)] A }").contains("unsupported"));
+        assert!(error_of("enum E { #[reflect(transient)] A }").contains("unsupported"));
+        // given twice
+        assert!(error_of("struct S { #[reflect(tooltip = \"a\", tooltip = \"b\")] a: u8 }").contains("twice"));
+        assert!(error_of("struct S { #[reflect(category = \"a\", category = \"b\")] a: u8 }").contains("twice"));
+        // incomplete or unknown range
+        assert!(error_of("struct S { #[reflect(range(min = 0))] a: u8 }").contains("max"));
+        assert!(error_of("struct S { #[reflect(range(low = 0, high = 1))] a: u8 }").contains("min"));
+        // empty text
+        assert!(error_of("struct S { #[reflect(tooltip = \"\")] a: u8 }").contains("empty"));
+        // `hidden = true` is not a flag with a value
+        assert!(expand_source("struct S { #[reflect(hidden = true)] a: u8 }").is_err());
+    }
+
+    #[cfg(feature = "docs")]
+    #[test]
+    fn doc_comments_are_captured_with_the_docs_feature() {
+        let (_, text) = expand_source("/// The hero.\n/// Second line.\nstruct Hero { /** Life. */ hp: u32 }").unwrap();
+        assert!(text.contains("with_docs"));
+        assert!(text.contains("The hero.\\nSecond line."));
+    }
+
+    #[cfg(not(feature = "docs"))]
+    #[test]
+    fn doc_comments_are_ignored_without_the_docs_feature() {
+        let (_, text) = expand_source("/// The hero.\nstruct Hero { /// Life.\n hp: u32 }").unwrap();
+        assert!(!text.contains("with_docs"));
     }
 }

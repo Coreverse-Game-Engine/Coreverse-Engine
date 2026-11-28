@@ -1,6 +1,6 @@
 [package]
 name = "reflection-macros"
-description = "The #[derive(Reflect)] macro of the reflection crate (milestone R2)."
+description = "The #[derive(Reflect)] macro of the reflection crate (milestones R2 and R5)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,10 @@ license.workspace = true
 syn.workspace = true
 quote.workspace = true
 proc-macro2.workspace = true
+
+[features]
+# Capture doc comments into the metadata of types, fields and variants (set by the `docs` feature of `reflection`).
+docs = []
 
 [lints]
 workspace = true

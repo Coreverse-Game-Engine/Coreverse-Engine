@@ -1,6 +1,6 @@
 [package]
 name = "reflection"
-description = "Coreverse's runtime type information (milestones R1-R3): stable type keys, static type descriptions, the Reflect traits, reflection of the standard types, #[derive(Reflect)], the type registry and type data; no unsafe code"
+description = "Coreverse's runtime type information (milestones R1-R5): stable type keys, static type descriptions, the Reflect traits, reflection of the standard types, #[derive(Reflect)], the type registry and type data, paths, dynamic values, metadata and the visitor; no unsafe code"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,10 @@ ccore = { path = "../ccore" }
 inventory.workspace = true
 reflection-macros = { path = "../../macros/reflection-macros" }
 utilities = { path = "../utilities" }
+
+[features]
+# Capture doc comments as `Metadata::docs()` (they are not kept otherwise, to keep the binary small).
+docs = ["reflection-macros/docs"]
 
 [lints]
 workspace = true

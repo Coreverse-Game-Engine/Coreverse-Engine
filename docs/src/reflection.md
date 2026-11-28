@@ -3,13 +3,16 @@
 `engine/rust/crates/reflection` is the engine's runtime type information: what a type is, what it is made of, and
 a way to read and change values without knowing their type at compile time. It is being built in milestones; this
 page describes what exists (R1, the core model, R2, `#[derive(Reflect)]`, R3, the type registry and type data, and
-R4, paths, `apply`, structural clone and equality, dynamic values and `from_reflect`) and what is planned. The crate uses `std`, `utilities` (the name
+R4, paths, `apply`, structural clone and equality, dynamic values and `from_reflect`, and R5, metadata, typed custom
+attributes and the visitor) and what is planned. The crate uses `std`, `utilities` (the name
 hash and poison-tolerant locks) and `ccore` (`ReflectError` converts into `CoreError`), and contains no `unsafe`
 code.
 
 > **Verification status.** R1, R2 and R3 were verified by the maintainer (`cargo fmt`, `cargo clippy --workspace
-> --all-features --all-targets -- -D warnings`, `cargo test`, Miri). R4 was written in a sandbox without a Rust
-> toolchain and has not been compiled, linted or tested yet: run the same four commands before merging.
+> --all-features --all-targets -- -D warnings`, `cargo test`, Miri). R4 and R5 were written in a sandbox without a
+> Rust toolchain; R5 has not been compiled, linted or tested yet: run the same four commands before merging it (and
+> `cargo test -p reflection` once without `--all-features`, which is the only way to run the tests of the
+> no-`docs` case).
 
 ## What is there (R1)
 
@@ -52,7 +55,7 @@ fields; `[T; N]`; `Vec<T>`; `Option<T>` (an enum with the variants `None` and `S
   for R6).
 * **`Option<T>` is an enum.** How it is written (`null`, a tagged union, ...) is up to the serializer.
 * **Reflection does not serialize.** It only describes and gives access; formats belong to the `serialization`
-  crate, which will walk values through the visitor of R5.
+  crate, which walks values through the visitor of R5.
 * **`Debug`, `Clone`, `PartialEq`, `Default` and `Hash` of reflected values** go through the type data of R3, not
   through the `Reflect` trait; the structural versions (`reflect_eq`, `clone_value`, `apply`) of R4 work without a
   registry.
@@ -184,6 +187,48 @@ R4-specific decisions:
   deserializer should take names from the type's description.
 * **Dynamic enums cannot switch variant themselves.** `try_replace` on a dynamic value reports `Unsupported`.
 
+## Metadata and the visitor (R5)
+
+| Item | Purpose |
+|:-----|:--------|
+| `Metadata` | What a tool needs to know about a type, a field or a variant besides its shape: `tooltip()`, `category()`, `range()`, `is_readonly()`, `is_hidden()`, `is_transient()`, `has_default()`, `docs()` and typed custom attributes (`custom::<T>()`, `has_custom::<T>()`). Read it from the description: `TypeInfo::metadata()` (and the `metadata()` of each `*Info`), `FieldInfo::metadata()`, `VariantInfo::metadata()`. Empty for the standard types and for anything without attributes. Cheap to clone (custom values are shared), built by hand with `with_*` methods. |
+| `ValueRange` | An inclusive `f64` range with `contains` and a `clamp` that never panics (the bounds are not checked: `min <= max` is expected). |
+| `visit`, `ReflectVisitor`, `VisitControl`, `VisitNode`, `VisitSlot` | A depth-first walk over any `&dyn Reflect`. The visitor gets `enter` (before the children) and `leave` (after them) for the root, every field of a struct, tuple, tuple struct or of the **active** variant of an enum, every item of a list, array or set, and every key and value of a map. `VisitNode` says where the walk is: `path()`, `depth()`, `slot()` (`Root`, `Field { name, index, info }`, `Item`, `MapKey`, `MapValue { index, key }`), `field()` and `metadata()` of the field the value is in. `enter` answers `Continue`, `SkipChildren` (`leave` is still called) or `Stop` (ends the walk successfully, no more calls); an `Err` ends it and is returned by `visit`. |
+
+The attributes of the derive (everything is read-only information; see the decisions below):
+
+| Attribute | On | Meaning |
+|:----------|:---|:--------|
+| `tooltip = "..."`, `category = "..."` | type, field, variant | Texts for editors; not empty, once each. |
+| `hidden` | type, field, variant | An editor does not show it. |
+| `readonly` | type, field | An editor shows it but does not let it be changed. |
+| `transient` | type, field | A serializer does not write it. Unlike `skip`, the field stays in the description and reachable. |
+| `range(min = .., max = ..)` | field | Numbers that convert into `f64` (`0`, `0.5`, `-3_i16`). |
+| `attr = <expression>` | type, field, variant | A typed custom attribute: any `Send + Sync + 'static` value, for example `attr = Slider { step: 0.5 }`. Repeatable; one value per type, a later value of the same type replaces the earlier one. |
+| `default` (R4) | field | Now also recorded as `has_default()`, so a serializer knows the field may be missing in data. |
+| doc comments | type, field, variant | Captured as `docs()` only with the `docs` cargo feature of `reflection` (it turns on `reflection-macros/docs`); otherwise no text is kept in the binary. |
+
+R5-specific decisions:
+
+* **Metadata is information, not enforcement.** `apply`, `path_set`, `reflect_mut` and `from_reflect` ignore it: a
+  `readonly` field can be written through reflection, a value outside `range` can be stored. Editors and serializers
+  decide what to do with it (for example `ValueRange::clamp`).
+* **One `Metadata` type for everything.** A flag that makes no sense in a place (`range` on a type, `readonly` on a
+  variant) is a compile error of the derive, not silently stored.
+* **Custom attributes are ordinary values.** They are held as `Arc<dyn Any + Send + Sync>` and found by `TypeId`, so
+  there is no registration step and no `Reflect` bound. They are not reflected themselves.
+* **`range` is written as `range(min = .., max = ..)`** and not as `min..=max`, so that the derive needs nothing
+  from `syn` but the attribute parser; the values go through `Into<f64>`, so `f64`, `f32`, small integers and
+  `i32` literals work, `i64` and larger integers do not.
+* **The visitor is read-only and not fallible by itself.** The error type belongs to the visitor (`Infallible` for
+  none). A mutable walk (editors that change values on the way) is not part of R5.
+* **Paths in `VisitNode::path()` are for people.** Structs, tuples, tuple structs, enums and lists use the text form
+  of `ReflectPath`; map entries and set items have no `ReflectPath` form and read `[key 0]`, `[value 0]` and
+  `[item 0]` (position in iteration order).
+* **Field descriptions come from the represented type.** A dynamic value that stands for a type (a `clone_value`
+  snapshot) gives its fields' metadata too; a dynamic value that stands for nothing (a hand-made `DynamicStruct`)
+  has `field()` equal to `None`.
+
 ## Example
 
 ```rust
@@ -204,7 +249,7 @@ assert_eq!(numbers, [1, 2, 3]);
 `TypeInfoCell`, a `Reflect` impl that starts with `impl_reflect_boilerplate!()`, and a `Struct` impl) for a struct
 with five fields and a recursive `Node`; `tests/derive.rs` covers the derive: structs, tuple and unit structs, enums,
 generics, paths, aliases and skipped fields, recursive types, containers of derived types; `tests/path.rs`,
-`tests/apply.rs` and `tests/clone_eq.rs` cover R4; `tests/registry.rs` and
+`tests/apply.rs` and `tests/clone_eq.rs` cover R4; `tests/metadata.rs` and `tests/visitor.rs` cover R5; `tests/registry.rs` and
 `tests/registry_conflicts.rs` cover the registry, type data and name conflicts (every integration test file is its own
 program, so each has its own `inventory`).
 
@@ -216,7 +261,7 @@ program, so each has its own `inventory`).
 | R2 | `reflection-macros` (`engine/rust/macros`): `#[derive(Reflect)]` for structs, tuple structs, unit structs, enums and generics; `skip`, `name`, `alias`, `rename`. Implemented. |
 | R3 | `TypeRegistry` (lookup by key, name and alias; collision errors), automatic collection with `inventory`, `TypeData` (`ReflectDefault`, `ReflectClone`, `ReflectPartialEq`, `ReflectDebug`, `ReflectHash`). Implemented. |
 | R4 | Paths (`a.b[2].c`), `apply`, `clone_value`, `reflect_eq`, dynamic values and `FromReflect`. Implemented. |
-| R5 | Field and type metadata (range, tooltip, category, readonly, hidden, transient, custom attributes) and a visitor. |
+| R5 | Field and type metadata (range, tooltip, category, readonly, hidden, transient, custom attributes, optional doc comments) and a visitor. Implemented. |
 | R6 | Engine types behind features (`math`, `ccore` ids, `Version`, `Handle`), `Arc` and `Cow`, edge cases. |
 | R7 | `registry.validate()`, diagnostics (optional `logging` feature), text and JSON schema export, an optional FFI surface for the editor. |
 | R8 | Benchmarks, remaining documentation, Miri. |

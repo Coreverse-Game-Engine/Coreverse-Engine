@@ -9,6 +9,7 @@ use std::any::{Any, TypeId};
 use std::fmt;
 
 use crate::key::TypeKey;
+use crate::metadata::Metadata;
 use crate::reflect::{ReflectKind, Typed};
 use crate::registry::TypeRegistration;
 
@@ -67,11 +68,12 @@ impl fmt::Debug for TypeRef {
 }
 
 /// The parts every description has: the key and the standard `TypeId`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Header {
     key: TypeKey,
     std_id: TypeId,
     aliases: &'static [&'static str],
+    metadata: Metadata,
 }
 
 impl Header {
@@ -80,6 +82,7 @@ impl Header {
             key,
             std_id: TypeId::of::<T>(),
             aliases: &[],
+            metadata: Metadata::new(),
         }
     }
 }
@@ -118,6 +121,18 @@ macro_rules! header_methods {
             self.header.aliases = aliases;
             self
         }
+
+        /// The metadata of the type (tooltip, category, custom attributes, ...); empty for most types.
+        pub fn metadata(&self) -> &Metadata {
+            &self.header.metadata
+        }
+
+        /// The description with the given metadata.
+        #[must_use]
+        pub fn with_metadata(mut self, metadata: Metadata) -> Self {
+            self.header.metadata = metadata;
+            self
+        }
     };
 }
 
@@ -128,6 +143,7 @@ pub struct FieldInfo {
     index: usize,
     ty: TypeRef,
     aliases: &'static [&'static str],
+    metadata: Metadata,
 }
 
 impl FieldInfo {
@@ -138,6 +154,7 @@ impl FieldInfo {
             index,
             ty,
             aliases: &[],
+            metadata: Metadata::new(),
         }
     }
 
@@ -148,6 +165,7 @@ impl FieldInfo {
             index,
             ty,
             aliases: &[],
+            metadata: Metadata::new(),
         }
     }
 
@@ -157,6 +175,18 @@ impl FieldInfo {
     pub fn with_aliases(mut self, aliases: &'static [&'static str]) -> Self {
         self.aliases = aliases;
         self
+    }
+
+    /// The field with the given metadata.
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: Metadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    /// The metadata of the field (tooltip, range, read-only, custom attributes, ...).
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
     }
 
     /// The name of the field; `None` for the fields of tuples and tuple structs.
@@ -313,6 +343,7 @@ pub struct VariantInfo {
     kind: VariantKind,
     fields: Vec<FieldInfo>,
     aliases: &'static [&'static str],
+    metadata: Metadata,
 }
 
 impl VariantInfo {
@@ -324,6 +355,7 @@ impl VariantInfo {
             kind: VariantKind::Unit,
             fields: Vec::new(),
             aliases: &[],
+            metadata: Metadata::new(),
         }
     }
 
@@ -335,6 +367,7 @@ impl VariantInfo {
             kind: VariantKind::Tuple,
             fields,
             aliases: &[],
+            metadata: Metadata::new(),
         }
     }
 
@@ -350,6 +383,7 @@ impl VariantInfo {
             kind: VariantKind::Struct,
             fields,
             aliases: &[],
+            metadata: Metadata::new(),
         }
     }
 
@@ -358,6 +392,18 @@ impl VariantInfo {
     pub fn with_aliases(mut self, aliases: &'static [&'static str]) -> Self {
         self.aliases = aliases;
         self
+    }
+
+    /// The variant with the given metadata.
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: Metadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    /// The metadata of the variant (tooltip, category, custom attributes, ...).
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
     }
 
     /// The name of the variant.
@@ -634,6 +680,21 @@ impl TypeInfo {
             Self::Map(info) => info.aliases(),
             Self::Set(info) => info.aliases(),
             Self::Opaque(info) => info.aliases(),
+        }
+    }
+
+    /// The metadata of the type (tooltip, category, custom attributes, ...); empty for most types.
+    pub fn metadata(&self) -> &Metadata {
+        match self {
+            Self::Struct(info) => info.metadata(),
+            Self::TupleStruct(info) => info.metadata(),
+            Self::Tuple(info) => info.metadata(),
+            Self::Enum(info) => info.metadata(),
+            Self::List(info) => info.metadata(),
+            Self::Array(info) => info.metadata(),
+            Self::Map(info) => info.metadata(),
+            Self::Set(info) => info.metadata(),
+            Self::Opaque(info) => info.metadata(),
         }
     }
 

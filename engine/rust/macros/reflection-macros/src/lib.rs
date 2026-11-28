@@ -42,6 +42,19 @@ mod expand;
 /// Every non-generic type also submits a `TypeEntry` to `inventory`, which `TypeRegistry::from_inventory`
 /// collects.
 ///
+/// Metadata attributes (read back through `Metadata`, see the `reflection` crate), on a type, a field or a
+/// variant unless noted:
+///
+/// * `tooltip = "..."` and `category = "..."`: texts for editors (not empty, once each).
+/// * `hidden`: editors do not show it.
+/// * `readonly` and `transient` (types and fields only): editors do not let it be changed; serializers do not
+///   write it (it stays reflected, unlike `skip`).
+/// * `attr = <expression>`: a typed custom attribute, for example `attr = Slider { step: 0.5 }`; any
+///   `Send + Sync + 'static` value; repeat it for several (one value per type, the last one wins).
+/// * `range(min = 0.0, max = 100.0)` (fields only): numbers that convert into `f64`.
+/// * Doc comments are captured when the `docs` feature is on (this crate's, which `reflection`'s `docs`
+///   feature turns on).
+///
 /// On a field:
 ///
 /// * `skip`: the field is not reflected (not in the description, not reachable). It does not need to be
@@ -49,7 +62,8 @@ mod expand;
 /// * `rename = "hp"`: the reflected name of a named field.
 /// * `alias = "health"`: another name of a named field; repeat it for several. `field` and `field_mut` accept
 ///   aliases, `name_at` and the description give the name.
-/// * `default`: `from_reflect` uses `Default::default()` when the value it is given has no such field.
+/// * `default`: `from_reflect` uses `Default::default()` when the value it is given has no such field (also
+///   recorded in the field's metadata as `has_default()`).
 ///
 /// On an enum variant:
 ///

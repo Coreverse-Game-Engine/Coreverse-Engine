@@ -1,9 +1,9 @@
 //! `reflection` — runtime type information for the Coreverse Engine: what a type is and what it is made
 //! of, and a way to read and change values without knowing their type at compile time.
 //!
-//! The crate is built in milestones (see `docs/src/reflection.md`). This is **R4**: the core model (R1),
+//! The crate is built in milestones (see `docs/src/reflection.md`). This is **R5**: the core model (R1),
 //! `#[derive(Reflect)]` (R2), the type registry and type data (R3), paths, `apply`, structural clone and
-//! equality, dynamic values and `from_reflect` (R4).
+//! equality, dynamic values and `from_reflect` (R4), metadata, typed custom attributes and the visitor (R5).
 //!
 //! # What is here today
 //!
@@ -35,6 +35,11 @@
 //! * [`Reflect::apply`], [`Reflect::clone_value`] and [`Reflect::reflect_eq`]: structural copy, snapshot and
 //!   comparison, built on dynamic values ([`DynamicStruct`], [`DynamicList`], ...), which can also be written
 //!   by hand as patches. [`Typed::from_reflect`] builds a concrete value back from a reflected one.
+//! * [`Metadata`]: tooltip, category, numeric [`ValueRange`], read-only / hidden / transient flags,
+//!   documentation and typed custom attributes of a type, field or variant, read from its description
+//!   (`field.metadata()`); set with `#[reflect(...)]` attributes.
+//! * [`visit`] and [`ReflectVisitor`]: a depth-first walk over a value that tells the visitor the path, the
+//!   field description and its metadata at every step; the base for serialization and editors.
 //! * [`impl_reflect_boilerplate!`], [`TypeInfoCell`] and [`GenericTypeInfoCell`]: what an implementation
 //!   written by hand needs; the derive uses all three.
 //!
@@ -93,6 +98,61 @@
 //! records an old path. On fields: `skip`, `rename = "..."`, `alias = "..."` (named fields only). On
 //! variants: `rename`, `alias`. Generic types get a `Typed` bound per type parameter and a path that contains
 //! the paths of the arguments; lifetime parameters, unions and enums without variants are errors.
+//!
+//! # Metadata and visiting
+//!
+//! Besides `skip`, `rename`, `alias` and `default`, the attributes below describe things for tools. They are
+//! plain information: reflection itself (`apply`, `path_set`, `reflect_mut`) ignores them.
+//!
+//! * On types, fields and variants: `tooltip = "..."`, `category = "..."`, `hidden`, and `attr = <expression>`
+//!   (a typed custom attribute: any `Send + Sync + 'static` value, found again with `metadata.custom::<T>()`;
+//!   may be repeated, one value per type).
+//! * On types and fields: `readonly` and `transient` (a serializer should not write it; unlike `skip` it stays
+//!   visible to reflection).
+//! * On fields: `range(min = .., max = ..)`, numbers that convert into `f64`.
+//! * Doc comments are captured as `metadata.docs()` when the `docs` feature of this crate is on.
+//!
+//! ```
+//! use reflection::{Reflect, ReflectVisitor, VisitControl, VisitNode, Typed, visit};
+//! use std::convert::Infallible;
+//!
+//! struct Slider {
+//!     step: f32,
+//! }
+//!
+//! #[derive(Reflect)]
+//! #[reflect(category = "Gameplay")]
+//! struct Health {
+//!     #[reflect(range(min = 0.0, max = 100.0), tooltip = "Current hit points")]
+//!     current: f32,
+//!     #[reflect(transient, attr = Slider { step: 0.5 })]
+//!     regen: f32,
+//! }
+//!
+//! let info = Health::static_type_info().as_struct().unwrap();
+//! assert_eq!(info.metadata().category(), Some("Gameplay"));
+//! let current = info.field("current").unwrap().metadata();
+//! assert_eq!(current.range().unwrap().max, 100.0);
+//! let regen = info.field("regen").unwrap().metadata();
+//! assert!(regen.is_transient());
+//! assert_eq!(regen.custom::<Slider>().unwrap().step, 0.5);
+//!
+//! // A serializer-like walk that leaves out transient fields.
+//! struct Names(Vec<String>);
+//! impl ReflectVisitor for Names {
+//!     type Error = Infallible;
+//!     fn enter(&mut self, node: &VisitNode<'_>, _: &dyn Reflect) -> Result<VisitControl, Infallible> {
+//!         if node.metadata().is_some_and(|metadata| metadata.is_transient()) {
+//!             return Ok(VisitControl::SkipChildren);
+//!         }
+//!         self.0.push(node.path().to_owned());
+//!         Ok(VisitControl::Continue)
+//!     }
+//! }
+//! let mut names = Names(Vec::new());
+//! visit(&Health { current: 1.0, regen: 2.0 }, &mut names).unwrap();
+//! assert_eq!(names.0, ["", "current"]);
+//! ```
 //!
 //! # The registry
 //!
@@ -199,6 +259,17 @@
 //! }
 //! ```
 //!
+//! ```compile_fail
+//! use reflection::Reflect;
+//!
+//! // `range` is only for fields
+//! #[derive(Reflect)]
+//! #[reflect(range(min = 0, max = 1))]
+//! struct Player {
+//!     health: u32,
+//! }
+//! ```
+//!
 //! # Conventions
 //!
 //! * `std`, `utilities` (the name hash and poison-tolerant locks) and `ccore` (`ReflectError` converts into
@@ -215,11 +286,13 @@ mod error;
 mod impls;
 mod info;
 mod key;
+mod metadata;
 mod ops;
 mod path;
 mod reflect;
 mod registry;
 mod type_data;
+mod visitor;
 
 pub use cell::{GenericTypeInfoCell, TypeInfoCell};
 pub use dynamic::{
@@ -232,6 +305,7 @@ pub use info::{
     TupleStructInfo, TypeInfo, TypeRef, VariantInfo, VariantKind,
 };
 pub use key::TypeKey;
+pub use metadata::{Metadata, ValueRange};
 pub use path::{GetPath, PathSegment, ReflectPath};
 pub use reflect::{
     Array, Enum, List, Map, Reflect, ReflectIter, ReflectKind, ReflectMut, ReflectRef, Set, Struct,
@@ -243,6 +317,7 @@ pub use type_data::{
     DebugValue, FromType, ReflectClone, ReflectDebug, ReflectDefault, ReflectFromReflect,
     ReflectHash, ReflectPartialEq, TypeData,
 };
+pub use visitor::{ReflectVisitor, VisitControl, VisitNode, VisitSlot, visit};
 
 /// What the code written by `#[derive(Reflect)]` needs; not part of the API.
 #[doc(hidden)]
