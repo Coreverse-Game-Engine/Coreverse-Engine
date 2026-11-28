@@ -85,6 +85,9 @@ public:
 
     [[nodiscard]] std::expected<Buffer, RenderError> CreateBuffer(const BufferDesc& desc) noexcept override;
 
+    [[nodiscard]] std::expected<ShaderModule, RenderError>
+    CreateShaderModule(std::span<const std::uint32_t> spirv) noexcept override;
+
     [[nodiscard]] std::expected<GraphicsPipeline, RenderError>
     CreateGraphicsPipeline(const Swapchain& swapchain, const GraphicsPipelineDesc& desc) noexcept override;
 
@@ -140,6 +143,7 @@ public:
 protected:
     void ReleaseBuffer(void* nativeHandle) noexcept override;
     void ReleaseGraphicsPipeline(void* nativeHandle) noexcept override;
+    void ReleaseShaderModule(void* nativeHandle) noexcept override;
     std::expected<void, RenderError>
     WriteBufferData(void* bufferHandle, const void* data, std::size_t size, std::size_t offset) noexcept override;
     void ReleaseSurface(void* nativeHandle) noexcept override;

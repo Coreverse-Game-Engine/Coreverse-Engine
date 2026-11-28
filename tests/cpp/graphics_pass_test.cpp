@@ -24,6 +24,7 @@
 #include "renderer/BuiltinShaders.hpp"
 #include "renderer/Diagnostics.hpp"
 #include "renderer/RenderDeviceFactory.hpp"
+#include "renderer/ShaderLoader.hpp"
 
 #if defined(_WIN32)
     #include <windows.h>
@@ -292,9 +293,21 @@ struct Scene {
             return Fail("Buffer::Write (index) failed", written.error());
         }
 
+        // The built-in shader module through the loader (no reader: built-in only; the VFS/file
+        // path is covered by shader_loader_test). One module holds both stages. The pipeline
+        // copies what it needs, so the module may go out of scope after CreateGraphicsPipeline().
+        const renderer::ShaderLoader shaderLoader(*device);
+        auto shader = shaderLoader.Load(renderer::kColoredMeshShaderName);
+        if (!shader) {
+            return Fail("ShaderLoader::Load(colored_mesh) failed", shader.error());
+        }
+        if (shader->origin != renderer::ShaderOrigin::Builtin || !shader->fallbackReason.empty()) {
+            return Fail("a loader without a reader must hand out the built-in shader without a fallback reason");
+        }
+
         renderer::GraphicsPipelineDesc pipelineDesc{};
-        pipelineDesc.vertexShader = renderer::ColoredMeshVertexShader();
-        pipelineDesc.fragmentShader = renderer::ColoredMeshFragmentShader();
+        pipelineDesc.vertex = {&shader->module, renderer::kColoredMeshVertexEntry};
+        pipelineDesc.fragment = {&shader->module, renderer::kColoredMeshFragmentEntry};
         pipelineDesc.vertexStride = sizeof(renderer::ColoredVertex);
         pipelineDesc.vertexAttributes = renderer::kColoredVertexAttributes;
         pipelineDesc.pushConstantSize = renderer::kColoredMeshPushConstantSize;
@@ -491,12 +504,41 @@ bool CheckMisuse(Scene& scene)
     if (scene.device->CreateGraphicsPipeline(scene.swapchain, empty)) {
         return Fail("CreateGraphicsPipeline without shaders unexpectedly succeeded");
     }
+    const renderer::ShaderLoader shaderLoader(*scene.device);
+    auto shader = shaderLoader.Load(renderer::kColoredMeshShaderName);
+    if (!shader) {
+        return Fail("ShaderLoader::Load(colored_mesh) failed", shader.error());
+    }
     renderer::GraphicsPipelineDesc badPush{};
-    badPush.vertexShader = renderer::ColoredMeshVertexShader();
-    badPush.fragmentShader = renderer::ColoredMeshFragmentShader();
+    badPush.vertex = {&shader->module, renderer::kColoredMeshVertexEntry};
+    badPush.fragment = {&shader->module, renderer::kColoredMeshFragmentEntry};
     badPush.pushConstantSize = 130;
     if (scene.device->CreateGraphicsPipeline(scene.swapchain, badPush)) {
         return Fail("CreateGraphicsPipeline with an oversized push constant block unexpectedly succeeded");
+    }
+
+    // Entry points are checked before the driver sees them: an unknown name, an empty name and a
+    // stage mix-up (the fragment entry as the vertex stage) all fail with a message, and none of
+    // them reaches the validation layer.
+    renderer::GraphicsPipelineDesc badEntry{};
+    badEntry.vertex = {&shader->module, "noSuchEntry"};
+    badEntry.fragment = {&shader->module, renderer::kColoredMeshFragmentEntry};
+    if (scene.device->CreateGraphicsPipeline(scene.swapchain, badEntry)) {
+        return Fail("CreateGraphicsPipeline with an unknown entry point unexpectedly succeeded");
+    }
+    badEntry.vertex = {&shader->module, ""};
+    if (scene.device->CreateGraphicsPipeline(scene.swapchain, badEntry)) {
+        return Fail("CreateGraphicsPipeline with an empty entry point name unexpectedly succeeded");
+    }
+    badEntry.vertex = {&shader->module, renderer::kColoredMeshFragmentEntry}; // wrong stage
+    if (scene.device->CreateGraphicsPipeline(scene.swapchain, badEntry)) {
+        return Fail("CreateGraphicsPipeline with a fragment entry point as the vertex stage unexpectedly succeeded");
+    }
+    renderer::GraphicsPipelineDesc noModule{};
+    noModule.vertex = {nullptr, renderer::kColoredMeshVertexEntry};
+    noModule.fragment = {&shader->module, renderer::kColoredMeshFragmentEntry};
+    if (scene.device->CreateGraphicsPipeline(scene.swapchain, noModule)) {
+        return Fail("CreateGraphicsPipeline without a vertex module unexpectedly succeeded");
     }
     return true;
 }

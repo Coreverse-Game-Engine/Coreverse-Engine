@@ -2,10 +2,12 @@
 
 #include <cstdint>
 #include <span>
+#include <string_view>
 
 namespace renderer {
 
 class RenderDevice;
+class ShaderModule;
 
 /// Vertex attribute formats the renderer needs so far (32-bit float vectors).
 enum class VertexFormat {
@@ -27,13 +29,19 @@ enum class CullMode {
     Front,
 };
 
+/// One programmable stage of a pipeline: an entry point of a ShaderModule. Both stages of a
+/// pipeline may name the same module (one SPIR-V file holding a vertex and a fragment entry point).
+struct ShaderStageDesc {
+    const ShaderModule* module = nullptr; ///< Must be valid and created by the same device; not kept after the call.
+    std::string_view entryPoint = "main"; ///< Entry point name inside the module (case-sensitive).
+};
+
 /// Everything needed to build a graphics pipeline for the swapchain it is created against.
-/// The shaders are SPIR-V (from Slang, GLSL or HLSL; see BuiltinShaders.hpp for the engine's own,
-/// compiled with Slang). Entry point is `main` for both (slangc names SPIR-V entry points `main`
-/// unless told otherwise).
+/// The shaders come from ShaderModules (RenderDevice::CreateShaderModule() / ShaderLoader::Load();
+/// BuiltinShaders.hpp has the engine's own, compiled from Slang).
 struct GraphicsPipelineDesc {
-    std::span<const std::uint32_t> vertexShader;   ///< SPIR-V words.
-    std::span<const std::uint32_t> fragmentShader; ///< SPIR-V words.
+    ShaderStageDesc vertex;
+    ShaderStageDesc fragment;
 
     /// One vertex buffer binding (binding 0), per-vertex rate; `vertexStride` bytes per vertex.
     std::uint32_t vertexStride = 0;

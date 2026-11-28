@@ -118,6 +118,24 @@ if(BUILD_RENDERER)
     add_test(NAME buffer_roundtrip_test COMMAND buffer_roundtrip_test)
     set_tests_properties(buffer_roundtrip_test PROPERTIES ${CV_GPU_TEST_PROPERTIES})
 
+    # Renderer M2 proof: RenderDevice::CreateShaderModule() and ShaderLoader --
+    # SPIR-V header/stream checks, the file-then-built-in fallback with its
+    # reason, name validation -- through an in-memory reader (no window, no VFS).
+    add_executable(shader_loader_test shader_loader_test.cpp)
+    target_link_libraries(shader_loader_test PRIVATE compiler_warnings renderer::renderer)
+    add_test(NAME shader_loader_test COMMAND shader_loader_test)
+    set_tests_properties(shader_loader_test PROPERTIES ${CV_GPU_TEST_PROPERTIES})
+
+    # Renderer M2 proof: the same loader behind renderer_vfs::MakeVfsShaderReader()
+    # against the real Rust VFS (Development mode, temporary project) -- the
+    # shader file under Assets/shaders wins over the built-in copy, bad files
+    # fall back. Needs the Rust library AND a Vulkan ICD, so it carries `gpu`
+    # (the label the "*-nogpu" presets exclude) like the other renderer tests.
+    add_executable(renderer_vfs_shader_test renderer_vfs_shader_test.cpp)
+    target_link_libraries(renderer_vfs_shader_test PRIVATE compiler_warnings renderer::vfs)
+    add_test(NAME renderer_vfs_shader_test COMMAND renderer_vfs_shader_test)
+    set_tests_properties(renderer_vfs_shader_test PROPERTIES ${CV_GPU_TEST_PROPERTIES})
+
     # Phase 5.3 proof: RenderDevice::CreateSurface() from a real native window
     # handle. Uses a dummy window this test creates itself (Win32/Xlib),
     # not Phase 6's Qt window.

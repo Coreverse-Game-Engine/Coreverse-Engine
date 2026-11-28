@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <span>
 #include <string_view>
 
 #include "renderer/Buffer.hpp"
@@ -11,6 +12,7 @@
 #include "renderer/GraphicsAPI.hpp"
 #include "renderer/GraphicsPipeline.hpp"
 #include "renderer/RenderError.hpp"
+#include "renderer/ShaderModule.hpp"
 #include "renderer/Surface.hpp"
 #include "renderer/Swapchain.hpp"
 
@@ -134,6 +136,16 @@ public:
     /// other device-owned resource.
     [[nodiscard]] virtual std::expected<Buffer, RenderError> CreateBuffer(const BufferDesc& desc) noexcept = 0;
 
+    /// Creates a shader module from SPIR-V words (the Vulkan backend; other backends will take
+    /// their own bytecode format here). The renderer checks the header (magic number, minimum size)
+    /// and walks the instruction stream to learn the module's entry points - a malformed stream is
+    /// rejected - but not the shader's contents: anything deeper is up to the driver and the
+    /// validation layer. CreateGraphicsPipeline() later refuses an entry point name the module does
+    /// not have, or one of the wrong stage. The words are copied, so the span need not outlive the
+    /// call. The returned module must be destroyed before this device's Shutdown().
+    [[nodiscard]] virtual std::expected<ShaderModule, RenderError>
+    CreateShaderModule(std::span<const std::uint32_t> spirv) noexcept = 0;
+
     /// Compiles a graphics pipeline for rendering.md into `swapchain` (its color format and, if it
     /// has one, depth format). See GraphicsPipelineDesc. Returns RenderErrorCode::Unsupported
     /// if the device has no dynamic rendering.md (Vulkan 1.3). The pipeline must be destroyed
@@ -203,6 +215,7 @@ protected:
     friend class CommandBuffer;
     friend class FrameSync;
     friend class GraphicsPipeline;
+    friend class ShaderModule;
 
     /// Lets a derived backend construct a Buffer. Buffer's constructor
     /// is private with only RenderDevice as a friend, and friendship
@@ -246,6 +259,19 @@ protected:
         return GraphicsPipeline(device, nativeHandle, pushConstantSize);
     }
 
+    /// Same purpose as MakeBuffer(), for ShaderModule - see there.
+    static ShaderModule MakeShaderModule(RenderDevice* device, void* nativeHandle) noexcept
+    {
+        return ShaderModule(device, nativeHandle);
+    }
+
+    /// The device that created `module` (nullptr for an empty module), so a backend can reject a
+    /// module that belongs to another device before touching its native handle.
+    static const RenderDevice* DeviceOf(const ShaderModule& module) noexcept
+    {
+        return module.m_device;
+    }
+
     /// Releases the backend resource behind a Buffer's native handle.
     /// Called only by Buffer's destructor/move-assignment — never call
     /// this directly; release a buffer by letting its Buffer object be
@@ -255,6 +281,9 @@ protected:
     /// Releases the backend resource behind a GraphicsPipeline's native handle; called only by
     /// GraphicsPipeline's destructor/move-assignment.
     virtual void ReleaseGraphicsPipeline(void* nativeHandle) noexcept = 0;
+
+    /// Same contract, for ShaderModule - called only by its destructor/move-assignment.
+    virtual void ReleaseShaderModule(void* nativeHandle) noexcept = 0;
 
     /// Backs Buffer::Write() (bounds are already checked there).
     virtual std::expected<void, RenderError>

@@ -184,6 +184,11 @@ if(BUILD_RUNTIME)
     add_subdirectory(engine/cpp/runtime)
 endif()
 
+# Reader that lets the renderer's ShaderLoader read shader files through the VFS; needs both sides.
+if(BUILD_RENDERER AND (BUILD_EDITOR OR BUILD_TESTS OR BUILD_RUNTIME))
+    add_subdirectory(engine/cpp/renderer-vfs)
+endif()
+
 if(BUILD_EDITOR)
     add_subdirectory(engine/cpp/editor)
 endif()

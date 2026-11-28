@@ -19,6 +19,8 @@ add_library(renderer STATIC
         src/Buffer.cpp
         src/GraphicsPipeline.cpp
         src/BuiltinShaders.cpp
+        src/ShaderModule.cpp
+        src/ShaderLoader.cpp
         src/Surface.cpp
         src/Swapchain.cpp
         src/CommandBuffer.cpp

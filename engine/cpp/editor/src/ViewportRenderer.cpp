@@ -17,6 +17,7 @@
 #include "renderer/GraphicsAPI.hpp"
 #include "renderer/RenderDeviceFactory.hpp"
 #include "renderer/RenderError.hpp"
+#include "renderer/ShaderLoader.hpp"
 
 namespace editor {
 
@@ -393,9 +394,19 @@ std::expected<void, QString> ViewportRenderer::createSceneResources()
         return std::unexpected(QStringLiteral("index buffer upload: %1").arg(ToQString(written.error())));
     }
 
+    // Built-in shader only for now: the editor has no project (and so no VFS) when it starts.
+    // Once it does, pass renderer_vfs::MakeVfsShaderReader() to the loader so a colored_mesh.spv in
+    // the project's Assets/shaders takes precedence. One module holds both stages; the pipeline
+    // copies what it needs, so the module may go out of scope after CreateGraphicsPipeline().
+    const renderer::ShaderLoader shaderLoader(*m_device);
+    auto shader = shaderLoader.Load(renderer::kColoredMeshShaderName);
+    if (!shader) {
+        return std::unexpected(QStringLiteral("shader: %1").arg(ToQString(shader.error())));
+    }
+
     renderer::GraphicsPipelineDesc pipelineDesc{};
-    pipelineDesc.vertexShader = renderer::ColoredMeshVertexShader();
-    pipelineDesc.fragmentShader = renderer::ColoredMeshFragmentShader();
+    pipelineDesc.vertex = {&shader->module, renderer::kColoredMeshVertexEntry};
+    pipelineDesc.fragment = {&shader->module, renderer::kColoredMeshFragmentEntry};
     pipelineDesc.vertexStride = sizeof(renderer::ColoredVertex);
     pipelineDesc.vertexAttributes = renderer::kColoredVertexAttributes;
     pipelineDesc.pushConstantSize = renderer::kColoredMeshPushConstantSize;

@@ -5,6 +5,7 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -112,6 +113,18 @@ struct VulkanSwapchainHandle {
     VkImage depthImage = VK_NULL_HANDLE;
     VmaAllocation depthAllocation = VK_NULL_HANDLE;
     VkImageView depthView = VK_NULL_HANDLE;
+};
+
+/// One OpEntryPoint of a SPIR-V module.
+struct SpirvEntryPoint {
+    std::string name;
+    std::uint32_t executionModel = 0; // SPIR-V ExecutionModel: 0 = Vertex, 4 = Fragment, 5 = GLCompute
+};
+
+/// What ShaderModule's void* points at for the Vulkan backend.
+struct VulkanShaderModuleHandle {
+    VkShaderModule module = VK_NULL_HANDLE;
+    std::vector<SpirvEntryPoint> entryPoints; // read once when the module is created
 };
 
 struct VulkanPipelineHandle {
@@ -1804,17 +1817,72 @@ VkCullModeFlags ToVkCullMode(CullMode mode) noexcept
 constexpr uint32_t kMaxPushConstantSize = 128; // the minimum maxPushConstantsSize every device must support
 constexpr VkShaderStageFlags kPushConstantStages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 
-VkShaderModule CreateShaderModule(VkDevice device, std::span<const std::uint32_t> words) noexcept
+constexpr std::uint32_t kSpirvMagic = 0x07230203;
+constexpr std::size_t kSpirvHeaderWords = 5; // magic, version, generator, id bound, schema
+constexpr std::uint32_t kSpirvOpEntryPoint = 15;
+constexpr std::uint32_t kSpirvExecutionModelVertex = 0;
+constexpr std::uint32_t kSpirvExecutionModelFragment = 4;
+
+/// Walks the instruction stream after the header and collects every OpEntryPoint (ExecutionModel,
+/// result id, Name, interface ids...). nullopt when the stream is malformed (a zero word count, an
+/// instruction running past the end, a name without terminator). Pipeline creation uses it to
+/// reject an entry point name the module does not have instead of handing the driver a name it
+/// cannot find, which validation layers report but a release build would not survive.
+std::optional<std::vector<SpirvEntryPoint>> ReadSpirvEntryPoints(std::span<const std::uint32_t> words)
 {
-    VkShaderModuleCreateInfo info{};
-    info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    info.codeSize = words.size_bytes();
-    info.pCode = words.data();
-    VkShaderModule module = VK_NULL_HANDLE;
-    if (vkCreateShaderModule(device, &info, nullptr, &module) != VK_SUCCESS) {
-        return VK_NULL_HANDLE;
+    std::vector<SpirvEntryPoint> entryPoints;
+    std::size_t at = kSpirvHeaderWords;
+    while (at < words.size()) {
+        const std::size_t wordCount = words[at] >> 16;
+        const std::uint32_t opcode = words[at] & 0xFFFFu;
+        if (wordCount == 0 || wordCount > words.size() - at) {
+            return std::nullopt;
+        }
+        if (opcode == kSpirvOpEntryPoint) {
+            if (wordCount < 4) { // opcode word, model, id, at least one word of name
+                return std::nullopt;
+            }
+            std::string name;
+            bool terminated = false;
+            for (std::size_t w = at + 3; w < at + wordCount && !terminated; ++w) {
+                for (unsigned byte = 0; byte < 4; ++byte) { // little-endian packing, NUL-terminated
+                    const char c = static_cast<char>((words[w] >> (8 * byte)) & 0xFFu);
+                    if (c == '\0') {
+                        terminated = true;
+                        break;
+                    }
+                    name.push_back(c);
+                }
+            }
+            if (!terminated) {
+                return std::nullopt;
+            }
+            entryPoints.push_back(SpirvEntryPoint{std::move(name), words[at + 1]});
+        }
+        at += wordCount;
     }
-    return module;
+    return entryPoints;
+}
+
+/// Empty when `stage` names an entry point of its module that has the execution model `model`;
+/// otherwise a sentence saying what is wrong and which entry points the module does have.
+std::string DescribeStageProblem(const ShaderStageDesc& stage, std::uint32_t model, std::string_view stageName)
+{
+    const auto& entryPoints =
+        static_cast<const VulkanShaderModuleHandle*>(stage.module->GetNativeHandle())->entryPoints;
+    std::string available;
+    for (const SpirvEntryPoint& entry : entryPoints) {
+        if (entry.name == stage.entryPoint) {
+            if (entry.executionModel == model) {
+                return {};
+            }
+            return "GraphicsPipelineDesc: entry point '" + entry.name + "' is not a " + std::string(stageName) +
+                   " entry point";
+        }
+        available += (available.empty() ? "'" : ", '") + entry.name + "'";
+    }
+    return "GraphicsPipelineDesc: the " + std::string(stageName) + " shader module has no entry point '" +
+           std::string(stage.entryPoint) + "' (it has: " + (available.empty() ? "none" : available) + ")";
 }
 
 } // namespace
@@ -1850,17 +1918,69 @@ VulkanRenderDevice::WriteBufferData(void* bufferHandle, const void* data, std::s
     return {};
 }
 
+std::expected<ShaderModule, RenderError>
+VulkanRenderDevice::CreateShaderModule(std::span<const std::uint32_t> spirv) noexcept
+{
+    if (spirv.size() < kSpirvHeaderWords || spirv[0] != kSpirvMagic) {
+        return std::unexpected(
+            RenderError{
+                RenderErrorCode::InitializationFailed,
+                "CreateShaderModule: the data is not a SPIR-V binary (no valid header)"
+            }
+        );
+    }
+    auto entryPoints = ReadSpirvEntryPoints(spirv);
+    if (!entryPoints) {
+        return std::unexpected(
+            RenderError{
+                RenderErrorCode::InitializationFailed, "CreateShaderModule: malformed SPIR-V instruction stream"
+            }
+        );
+    }
+    VkShaderModuleCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    info.codeSize = spirv.size_bytes();
+    info.pCode = spirv.data();
+    VkShaderModule module = VK_NULL_HANDLE;
+    if (const VkResult result = vkCreateShaderModule(m_device, &info, nullptr, &module); result != VK_SUCCESS) {
+        return std::unexpected(MakeVkError(RenderErrorCode::InitializationFailed, "vkCreateShaderModule", result));
+    }
+    auto* handle = new (std::nothrow) VulkanShaderModuleHandle{module, std::move(*entryPoints)};
+    if (handle == nullptr) {
+        vkDestroyShaderModule(m_device, module, nullptr);
+        return std::unexpected(RenderError{RenderErrorCode::OutOfMemory, "out of memory for shader module handle"});
+    }
+    return MakeShaderModule(this, handle);
+}
+
+void VulkanRenderDevice::ReleaseShaderModule(void* nativeHandle) noexcept
+{
+    if (nativeHandle == nullptr) {
+        return;
+    }
+    auto* handle = static_cast<VulkanShaderModuleHandle*>(nativeHandle);
+    vkDestroyShaderModule(m_device, handle->module, nullptr);
+    delete handle;
+}
+
 std::expected<GraphicsPipeline, RenderError>
 VulkanRenderDevice::CreateGraphicsPipeline(const Swapchain& swapchain, const GraphicsPipelineDesc& desc) noexcept
 {
     if (!m_dynamicRendering) {
         return std::unexpected(UnsupportedDynamicRendering());
     }
-    const auto invalid = [](const char* message) {
-        return std::unexpected(RenderError{RenderErrorCode::InitializationFailed, message});
+    const auto invalid = [](std::string message) {
+        return std::unexpected(RenderError{RenderErrorCode::InitializationFailed, std::move(message)});
     };
-    if (desc.vertexShader.empty() || desc.fragmentShader.empty()) {
-        return invalid("GraphicsPipelineDesc needs both a vertex and a fragment shader");
+    const auto validStage = [this](const ShaderStageDesc& stage) {
+        return stage.module != nullptr && stage.module->IsValid() && DeviceOf(*stage.module) == this &&
+               !stage.entryPoint.empty();
+    };
+    if (!validStage(desc.vertex) || !validStage(desc.fragment)) {
+        return invalid(
+            "GraphicsPipelineDesc needs a vertex and a fragment stage: a valid ShaderModule created by this device "
+            "and a non-empty entry point name each"
+        );
     }
     if (desc.pushConstantSize > kMaxPushConstantSize || desc.pushConstantSize % 4 != 0) {
         return invalid("GraphicsPipelineDesc::pushConstantSize must be a multiple of 4 and at most 128");
@@ -1876,26 +1996,33 @@ VulkanRenderDevice::CreateGraphicsPipeline(const Swapchain& swapchain, const Gra
         return invalid("depthTest needs a swapchain created with SwapchainDesc::depthBuffer");
     }
 
-    const VkShaderModule vertexModule = CreateShaderModule(m_device, desc.vertexShader);
-    const VkShaderModule fragmentModule = CreateShaderModule(m_device, desc.fragmentShader);
-    const auto destroyModules = [&] {
-        vkDestroyShaderModule(m_device, vertexModule, nullptr); // VK_NULL_HANDLE is a valid no-op
-        vkDestroyShaderModule(m_device, fragmentModule, nullptr);
-    };
-    if (vertexModule == VK_NULL_HANDLE || fragmentModule == VK_NULL_HANDLE) {
-        destroyModules();
-        return std::unexpected(RenderError{RenderErrorCode::InitializationFailed, "vkCreateShaderModule failed"});
+    if (std::string problem = DescribeStageProblem(desc.vertex, kSpirvExecutionModelVertex, "vertex");
+        !problem.empty()) {
+        return invalid(std::move(problem));
     }
+    if (std::string problem = DescribeStageProblem(desc.fragment, kSpirvExecutionModelFragment, "fragment");
+        !problem.empty()) {
+        return invalid(std::move(problem));
+    }
+
+    // The modules stay owned by the caller (vkCreateGraphicsPipelines copies what it needs), and
+    // pName must be NUL-terminated, which a string_view is not.
+    const VkShaderModule vertexModule =
+        static_cast<const VulkanShaderModuleHandle*>(desc.vertex.module->GetNativeHandle())->module;
+    const VkShaderModule fragmentModule =
+        static_cast<const VulkanShaderModuleHandle*>(desc.fragment.module->GetNativeHandle())->module;
+    const std::string vertexEntry(desc.vertex.entryPoint);
+    const std::string fragmentEntry(desc.fragment.entryPoint);
 
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
     stages[0].module = vertexModule;
-    stages[0].pName = "main";
+    stages[0].pName = vertexEntry.c_str();
     stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     stages[1].module = fragmentModule;
-    stages[1].pName = "main";
+    stages[1].pName = fragmentEntry.c_str();
 
     VkVertexInputBindingDescription binding{};
     binding.binding = 0;
@@ -1970,7 +2097,6 @@ VulkanRenderDevice::CreateGraphicsPipeline(const Swapchain& swapchain, const Gra
     layoutInfo.pPushConstantRanges = &pushRange;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     if (const VkResult result = vkCreatePipelineLayout(m_device, &layoutInfo, nullptr, &layout); result != VK_SUCCESS) {
-        destroyModules();
         return std::unexpected(MakeVkError(RenderErrorCode::InitializationFailed, "vkCreatePipelineLayout", result));
     }
 
@@ -2003,7 +2129,6 @@ VulkanRenderDevice::CreateGraphicsPipeline(const Swapchain& swapchain, const Gra
     VkPipeline pipeline = VK_NULL_HANDLE;
     const VkResult pipelineResult =
         vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline);
-    destroyModules();
     if (pipelineResult != VK_SUCCESS) {
         vkDestroyPipelineLayout(m_device, layout, nullptr);
         return std::unexpected(
