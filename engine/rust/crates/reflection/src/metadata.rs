@@ -323,7 +323,9 @@ mod tests {
 
     #[test]
     fn custom_attributes_are_found_by_type() {
-        let metadata = Metadata::new().with_custom(Step(0.5)).with_custom(Label("hp"));
+        let metadata = Metadata::new()
+            .with_custom(Step(0.5))
+            .with_custom(Label("hp"));
         assert_eq!(metadata.custom_len(), 2);
         assert_eq!(metadata.custom::<Step>(), Some(&Step(0.5)));
         assert_eq!(metadata.custom::<Label>(), Some(&Label("hp")));
@@ -334,7 +336,9 @@ mod tests {
 
     #[test]
     fn same_custom_type_replaces() {
-        let metadata = Metadata::new().with_custom(Step(1.0)).with_custom(Step(2.0));
+        let metadata = Metadata::new()
+            .with_custom(Step(1.0))
+            .with_custom(Step(2.0));
         assert_eq!(metadata.custom_len(), 1);
         assert_eq!(metadata.custom::<Step>(), Some(&Step(2.0)));
     }
@@ -348,7 +352,10 @@ mod tests {
 
     #[test]
     fn range_contains_and_clamp() {
-        let range = ValueRange { min: 0.0, max: 10.0 };
+        let range = ValueRange {
+            min: 0.0,
+            max: 10.0,
+        };
         assert!(range.contains(0.0));
         assert!(range.contains(10.0));
         assert!(!range.contains(10.5));

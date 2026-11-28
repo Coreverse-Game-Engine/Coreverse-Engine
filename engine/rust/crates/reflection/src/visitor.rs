@@ -288,7 +288,15 @@ impl<V: ReflectVisitor + ?Sized> Walker<'_, V> {
                         Some(name) => self.field_text(name),
                         None => self.field_text(&index.to_string()),
                     };
-                    go!(self.child(&text, item, VisitSlot::Field { name, index, info: field }));
+                    go!(self.child(
+                        &text,
+                        item,
+                        VisitSlot::Field {
+                            name,
+                            index,
+                            info: field
+                        }
+                    ));
                 }
             }
             ReflectRef::TupleStruct(view) => {
@@ -346,7 +354,15 @@ impl<V: ReflectVisitor + ?Sized> Walker<'_, V> {
                         Some(name) => self.field_text(name),
                         None => self.field_text(&index.to_string()),
                     };
-                    go!(self.child(&text, item, VisitSlot::Field { name, index, info: field }));
+                    go!(self.child(
+                        &text,
+                        item,
+                        VisitSlot::Field {
+                            name,
+                            index,
+                            info: field
+                        }
+                    ));
                 }
             }
             ReflectRef::List(view) => {

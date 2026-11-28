@@ -27,7 +27,10 @@ struct Player {
 fn player() -> Player {
     Player {
         name: "Ada".to_string(),
-        stats: Stats { health: 10, mana: 5 },
+        stats: Stats {
+            health: 10,
+            mana: 5,
+        },
         items: vec!["axe".to_string(), "bow".to_string()],
         pos: (1.0, 2.0),
         tag: Some(7),
@@ -110,14 +113,7 @@ fn leave_comes_after_the_children() {
     visit(&Stats { health: 1, mana: 2 }, &mut recorder).unwrap();
     assert_eq!(
         recorder.events,
-        [
-            "+<root>",
-            "+health",
-            "-health",
-            "+mana",
-            "-mana",
-            "-<root>"
-        ]
+        ["+<root>", "+health", "-health", "+mana", "-mana", "-<root>"]
     );
 }
 
@@ -334,10 +330,7 @@ fn enum_variant_fields_have_their_field_info() {
     visit(&Shape::Rect { w: 1.0, h: 2.0 }, &mut tooltips).unwrap();
     assert_eq!(
         tooltips.0,
-        [
-            ("w".to_string(), Some("Width")),
-            ("h".to_string(), None)
-        ]
+        [("w".to_string(), Some("Width")), ("h".to_string(), None)]
     );
 }
 
@@ -371,7 +364,11 @@ fn slots_describe_where_a_value_sits() {
     let mut slots = Slots(Vec::new());
     visit(&player(), &mut slots).unwrap();
     assert!(slots.0.contains(&"root".to_string()));
-    assert!(slots.0.contains(&"field Some(\"name\") #0 info=true".to_string()));
+    assert!(
+        slots
+            .0
+            .contains(&"field Some(\"name\") #0 info=true".to_string())
+    );
     assert!(slots.0.contains(&"item 1".to_string()));
     assert!(slots.0.contains(&"key 0".to_string()));
     assert!(slots.0.contains(&"value 0 of Some(\"a\")".to_string()));

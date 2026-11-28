@@ -1286,17 +1286,30 @@ mod tests {
     #[test]
     fn metadata_attributes_are_checked() {
         // `range` only on fields
-        assert!(error_of("#[reflect(range(min = 0, max = 1))] struct S { a: u8 }").contains("unsupported"));
-        assert!(error_of("enum E { #[reflect(range(min = 0, max = 1))] A }").contains("unsupported"));
+        assert!(
+            error_of("#[reflect(range(min = 0, max = 1))] struct S { a: u8 }")
+                .contains("unsupported")
+        );
+        assert!(
+            error_of("enum E { #[reflect(range(min = 0, max = 1))] A }").contains("unsupported")
+        );
         // `readonly` and `transient` not on variants
         assert!(error_of("enum E { #[reflect(readonly)] A }").contains("unsupported"));
         assert!(error_of("enum E { #[reflect(transient)] A }").contains("unsupported"));
         // given twice
-        assert!(error_of("struct S { #[reflect(tooltip = \"a\", tooltip = \"b\")] a: u8 }").contains("twice"));
-        assert!(error_of("struct S { #[reflect(category = \"a\", category = \"b\")] a: u8 }").contains("twice"));
+        assert!(
+            error_of("struct S { #[reflect(tooltip = \"a\", tooltip = \"b\")] a: u8 }")
+                .contains("twice")
+        );
+        assert!(
+            error_of("struct S { #[reflect(category = \"a\", category = \"b\")] a: u8 }")
+                .contains("twice")
+        );
         // incomplete or unknown range
         assert!(error_of("struct S { #[reflect(range(min = 0))] a: u8 }").contains("max"));
-        assert!(error_of("struct S { #[reflect(range(low = 0, high = 1))] a: u8 }").contains("min"));
+        assert!(
+            error_of("struct S { #[reflect(range(low = 0, high = 1))] a: u8 }").contains("min")
+        );
         // empty text
         assert!(error_of("struct S { #[reflect(tooltip = \"\")] a: u8 }").contains("empty"));
         // `hidden = true` is not a flag with a value
@@ -1306,7 +1319,9 @@ mod tests {
     #[cfg(feature = "docs")]
     #[test]
     fn doc_comments_are_captured_with_the_docs_feature() {
-        let (_, text) = expand_source("/// The hero.\n/// Second line.\nstruct Hero { /** Life. */ hp: u32 }").unwrap();
+        let (_, text) =
+            expand_source("/// The hero.\n/// Second line.\nstruct Hero { /** Life. */ hp: u32 }")
+                .unwrap();
         assert!(text.contains("with_docs"));
         assert!(text.contains("The hero.\\nSecond line."));
     }
@@ -1314,7 +1329,8 @@ mod tests {
     #[cfg(not(feature = "docs"))]
     #[test]
     fn doc_comments_are_ignored_without_the_docs_feature() {
-        let (_, text) = expand_source("/// The hero.\nstruct Hero { /// Life.\n hp: u32 }").unwrap();
+        let (_, text) =
+            expand_source("/// The hero.\nstruct Hero { /// Life.\n hp: u32 }").unwrap();
         assert!(!text.contains("with_docs"));
     }
 }

@@ -58,7 +58,10 @@ fn type_metadata_is_read_from_the_description() {
     assert!(metadata.is_transient());
     assert!(!metadata.is_hidden());
     assert!(!metadata.is_readonly());
-    assert_eq!(metadata.custom::<Group>().map(|group| group.0), Some("heroes"));
+    assert_eq!(
+        metadata.custom::<Group>().map(|group| group.0),
+        Some("heroes")
+    );
     assert_eq!(metadata.custom_len(), 1);
 }
 
